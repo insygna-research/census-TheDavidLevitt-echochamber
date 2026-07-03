@@ -1,42 +1,113 @@
-"""Google Gemini provider."""
+"""Google Gemini provider (google-genai SDK).
+
+Reaches Gemini through either front door:
+
+- Gemini API (AI Studio): set GEMINI_API_KEY (or GOOGLE_API_KEY).
+- Vertex AI: set GOOGLE_GENAI_USE_VERTEXAI=true + GOOGLE_CLOUD_PROJECT
+  (+ GOOGLE_APPLICATION_CREDENTIALS or gcloud ADC). Same models, but billed
+  to the GCP project — where cloud credits apply.
+
+Native tool calling is supported on both.
+"""
 
 import os
 import time
 from typing import Optional
 
-from .base import LLMProvider, LLMResponse, Message, ToolDef
+from .base import LLMProvider, LLMResponse, Message, ToolCall, ToolDef
 from .retry import call_with_retries
+
+_SCHEMA_TYPE_MAP = {
+    "object": "OBJECT", "string": "STRING", "number": "NUMBER",
+    "integer": "INTEGER", "boolean": "BOOLEAN", "array": "ARRAY",
+}
+
+
+def _to_gemini_schema(schema: dict) -> dict:
+    """Normalize a JSON Schema dict to Gemini's Schema shape (upper-case types)."""
+    out = {}
+    for key, value in schema.items():
+        if key == "type" and isinstance(value, str):
+            out[key] = _SCHEMA_TYPE_MAP.get(value.lower(), value)
+        elif key == "properties" and isinstance(value, dict):
+            out[key] = {k: _to_gemini_schema(v) for k, v in value.items()}
+        elif key == "items" and isinstance(value, dict):
+            out[key] = _to_gemini_schema(value)
+        else:
+            out[key] = value
+    return out
+
+
+def build_client(api_key: Optional[str] = None):
+    """Construct a google-genai Client.
+
+    Returns:
+        (client, mode) where mode is "vertex:<project>" or "gemini-api"
+    """
+    try:
+        from google import genai
+    except ImportError:
+        raise ImportError("Please install google-genai: pip install google-genai")
+
+    api_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    use_vertex = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() in ("1", "true", "yes")
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+
+    if use_vertex or (not api_key and project):
+        if not project:
+            raise ValueError(
+                "Vertex mode needs GOOGLE_CLOUD_PROJECT (and ADC or GOOGLE_APPLICATION_CREDENTIALS)."
+            )
+        location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+        return genai.Client(vertexai=True, project=project, location=location), f"vertex:{project}"
+    if api_key:
+        return genai.Client(api_key=api_key), "gemini-api"
+    raise ValueError(
+        "Gemini needs GEMINI_API_KEY (Gemini API) or GOOGLE_GENAI_USE_VERTEXAI=true "
+        "+ GOOGLE_CLOUD_PROJECT for Vertex AI."
+    )
 
 
 class GeminiProvider(LLMProvider):
-    """Provider for Google's Gemini models.
+    """Provider for Google's Gemini models via the google-genai SDK."""
 
-    Text-only for now (supports_tools stays False): the legacy
-    google-generativeai SDK makes tool round-trips awkward, so agents on
-    Gemini use the sentinel-tag fallback. Migrating to the google-genai SDK
-    would unlock native tools here.
-    """
+    supports_tools = True
 
     def __init__(
         self,
-        model: str = "gemini-2.0-flash",
+        model: str = "gemini-2.5-flash",
         api_key: Optional[str] = None,
     ):
         self.model = model
-        self.api_key = api_key or os.environ.get("GEMINI_API_KEY")
-        if not self.api_key:
-            raise ValueError(
-                "Gemini API key required. Set GEMINI_API_KEY env var or pass api_key."
-            )
+        self.client, self.mode = build_client(api_key)
 
-        try:
-            import google.generativeai as genai
-            genai.configure(api_key=self.api_key)
-            self.genai = genai
-        except ImportError:
-            raise ImportError(
-                "Please install google-generativeai: pip install google-generativeai"
-            )
+    def _to_contents(self, messages: list[Message]) -> list[dict]:
+        contents = []
+        for msg in messages:
+            if msg.role == "system":
+                continue  # handled via system_instruction
+            if msg.role == "assistant" and msg.tool_calls:
+                parts = []
+                if msg.content:
+                    parts.append({"text": msg.content})
+                for tc in msg.tool_calls:
+                    parts.append({"function_call": {"name": tc.name, "args": tc.arguments}})
+                contents.append({"role": "model", "parts": parts})
+            elif msg.role == "tool":
+                # Gemini keys tool results by function NAME; our synthetic
+                # ToolCall ids are "<name>::<index>" so the name is recoverable.
+                name = (msg.tool_call_id or "tool").split("::")[0]
+                contents.append({
+                    "role": "user",
+                    "parts": [{"function_response": {
+                        "name": name,
+                        "response": {"result": msg.content},
+                    }}],
+                })
+            else:
+                role = "model" if msg.role == "assistant" else "user"
+                contents.append({"role": role, "parts": [{"text": msg.content}]})
+        return contents
 
     def complete(
         self,
@@ -47,59 +118,68 @@ class GeminiProvider(LLMProvider):
         tools: Optional[list[ToolDef]] = None,
         tool_choice: Optional[str] = None,
     ) -> LLMResponse:
-        # Create model with system instruction
-        generation_config = {
+        config: dict = {
             "temperature": temperature,
             "max_output_tokens": max_tokens,
         }
+        if system_prompt:
+            config["system_instruction"] = system_prompt
+        if tools:
+            config["tools"] = [{
+                "function_declarations": [
+                    {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": _to_gemini_schema(t.parameters),
+                    }
+                    for t in tools
+                ],
+            }]
+            if tool_choice:
+                config["tool_config"] = {"function_calling_config": {
+                    "mode": "ANY",
+                    "allowed_function_names": [tool_choice],
+                }}
 
-        model = self.genai.GenerativeModel(
-            model_name=self.model,
-            generation_config=generation_config,
-            system_instruction=system_prompt if system_prompt else None,
-        )
+        contents = self._to_contents(messages) or [{"role": "user", "parts": [{"text": "Begin."}]}]
 
-        # Convert messages to Gemini format
-        # Gemini uses "user" and "model" roles
-        gemini_history = []
-        for msg in messages:
-            role = "model" if msg.role == "assistant" else "user"
-            gemini_history.append({
-                "role": role,
-                "parts": [msg.content],
-            })
-
-        # Start chat with history (all but last message)
         start = time.time()
-        if len(gemini_history) > 1:
-            chat = model.start_chat(history=gemini_history[:-1])
-            # Send last message
-            response = call_with_retries(
-                lambda: chat.send_message(gemini_history[-1]["parts"][0])
+        response = call_with_retries(
+            lambda: self.client.models.generate_content(
+                model=self.model, contents=contents, config=config,
             )
-        elif gemini_history:
-            # Single message
-            response = call_with_retries(
-                lambda: model.generate_content(gemini_history[0]["parts"][0])
-            )
-        else:
-            # No messages - shouldn't happen but handle it
-            response = call_with_retries(lambda: model.generate_content("Hello"))
+        )
         latency_ms = (time.time() - start) * 1000
 
-        # Extract usage if available
+        texts: list[str] = []
+        tool_calls: list[ToolCall] = []
+        candidates = response.candidates or []
+        parts = (candidates[0].content.parts or []) if candidates and candidates[0].content else []
+        for i, part in enumerate(parts):
+            fc = getattr(part, "function_call", None)
+            if fc:
+                tool_calls.append(ToolCall(
+                    id=f"{fc.name}::{i}",
+                    name=fc.name,
+                    arguments=dict(fc.args or {}),
+                ))
+            elif getattr(part, "text", None):
+                texts.append(part.text)
+
         usage = None
-        if hasattr(response, 'usage_metadata') and response.usage_metadata:
+        meta = getattr(response, "usage_metadata", None)
+        if meta:
             usage = {
-                "input_tokens": response.usage_metadata.prompt_token_count,
-                "output_tokens": response.usage_metadata.candidates_token_count,
+                "input_tokens": meta.prompt_token_count or 0,
+                "output_tokens": (meta.candidates_token_count or 0) + (getattr(meta, "thoughts_token_count", 0) or 0),
             }
 
         return LLMResponse(
-            content=response.text,
+            content="\n".join(texts),
             model=self.model,
             usage=usage,
-            raw_response=None,  # Gemini response isn't easily serializable
+            raw_response=None,
+            tool_calls=tool_calls,
             latency_ms=latency_ms,
         )
 

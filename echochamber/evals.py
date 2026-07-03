@@ -11,7 +11,7 @@ APA-shaped "finding" that a procurement agent can ingest.
 Usage:
     python -m echochamber.evals \\
       --candidate-provider gemini --candidate gemini-2.5-pro \\
-      --incumbent-provider gemini --incumbent gemini-2.0-flash \\
+      --incumbent-provider gemini --incumbent gemini-2.5-flash \\
       --judge-provider gemini --judge gemini-2.5-pro \\
       --topics 3 --rounds 1 --max-total-tokens 30000
 """

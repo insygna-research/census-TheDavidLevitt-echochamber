@@ -49,6 +49,7 @@ from .core.usage import UsageMeter
 from .recommendations import load_apa_data, recommend_for_debate
 
 PROVIDERS = ["lmstudio", "anthropic", "openai", "together", "gemini"]
+DEFAULT_PROVIDER = os.environ.get("ECHOCHAMBER_DEFAULT_PROVIDER", "lmstudio")
 ROLE_EMOJI = {"prosecution": "⚖️", "defense": "🛡️", "moderator": "👨‍⚖️", "system": "⚙️"}
 
 PROVIDER_ENV_KEYS = {
@@ -141,6 +142,12 @@ def test_provider_key(provider: str, key: str) -> str:
             model = get_lmstudio_model()
             return f"✅ lmstudio: reachable, serving `{model}`" if model else \
                 "❌ lmstudio: no server on localhost:1234 (start LM Studio and load a model)"
+        if provider == "gemini":
+            # Key OR Vertex env config both count as configured
+            from .providers.gemini import build_client
+            client, mode = build_client(key or None)
+            next(iter(client.models.list()))
+            return f"✅ gemini: works ({mode})"
         if not key:
             return f"❌ {provider}: no key entered or saved"
         if provider == "anthropic":
@@ -162,10 +169,6 @@ def test_provider_key(provider: str, key: str) -> str:
                 },
             )
             urllib.request.urlopen(req, timeout=10)
-        elif provider == "gemini":
-            import google.generativeai as genai
-            genai.configure(api_key=key)
-            next(iter(genai.list_models()))
         return f"✅ {provider}: key works"
     except ImportError as e:
         return f"❌ {provider}: SDK not installed ({e.name}) — run: uv sync --extra all"
@@ -367,7 +370,7 @@ def _debate_tab():
                     gr.Markdown(f"**{ROLE_EMOJI[role]} {role.capitalize()}**")
                     with gr.Row():
                         provider = gr.Dropdown(
-                            PROVIDERS, value="lmstudio", label="Provider", scale=1,
+                            PROVIDERS, value=DEFAULT_PROVIDER, label="Provider", scale=1,
                         )
                         model = gr.Textbox(
                             label="Model (blank = provider default)", scale=2,

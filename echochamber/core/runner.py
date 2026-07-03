@@ -31,7 +31,7 @@ DEFAULT_MODELS = {
     "openai": "gpt-4o",
     "together": "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo",
     "lmstudio": "local-model",  # Will be auto-detected
-    "gemini": "gemini-2.0-flash",
+    "gemini": "gemini-2.5-flash",
 }
 
 # Default models for moderator/judge role (can differ from advocates)
@@ -40,7 +40,7 @@ DEFAULT_MODERATOR_MODELS = {
     "openai": "gpt-4o",
     "together": "deepseek-ai/DeepSeek-R1",
     "lmstudio": "local-model",
-    "gemini": "gemini-2.0-flash",
+    "gemini": "gemini-2.5-flash",
 }
 
 
@@ -76,6 +76,9 @@ class DebateSpec:
     max_searches_per_turn: int = 2
     moderator_searches_per_turn: int = 5
     max_total_tokens: Optional[int] = None  # hard stop across all agents (None = unlimited)
+    # Per-response output cap. Reasoning models (Gemini 2.5, o-series) spend
+    # "thinking" tokens from this budget, so 1-2k truncates visible output.
+    max_response_tokens: int = 4096
     verbose: bool = True
     transcript_dir: str = "./transcripts"
     save_transcript_json: Optional[str] = None
@@ -194,6 +197,7 @@ def build_agent(
     extra_instructions: str = "",
     meter: Optional[UsageMeter] = None,
     provider_factory: Callable = create_provider,
+    max_tokens: int = 4096,
 ) -> Agent:
     """Create a configured agent for a debate role."""
     llm_provider = provider_factory(provider, model)
@@ -216,6 +220,7 @@ def build_agent(
         provider=llm_provider,
         system_prompt=system_prompt,
         meter=meter,
+        max_tokens=max_tokens,
     )
 
 
@@ -286,6 +291,7 @@ def run_debate(
         extra_instructions=role_instructions[Role.PROSECUTION],
         meter=meter,
         provider_factory=provider_factory,
+        max_tokens=spec.max_response_tokens,
     )
     log(f"  ✓ Prosecution: {prosecution}")
 
@@ -300,6 +306,7 @@ def run_debate(
         extra_instructions=role_instructions[Role.DEFENSE],
         meter=meter,
         provider_factory=provider_factory,
+        max_tokens=spec.max_response_tokens,
     )
     log(f"  ✓ Defense: {defense}")
 
@@ -315,6 +322,7 @@ def run_debate(
         extra_instructions=role_instructions[Role.MODERATOR],
         meter=meter,
         provider_factory=provider_factory,
+        max_tokens=spec.max_response_tokens,
     )
     log(f"  ✓ Moderator: {moderator}")
 
