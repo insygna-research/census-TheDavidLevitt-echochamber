@@ -1,0 +1,53 @@
+# Environment variables (contains API keys)
+.env
+
+# Runtime debate outputs — may contain private case material
+transcripts/
+
+# Private case folders — only the bundled example is tracked
+cases/*
+!cases/example_case/
+
+# Local Claude Code settings
+.claude/settings.local.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Cache directories
+.chroma/
+.cache/
+
+# OS files
+.DS_Store
+Thumbs.db

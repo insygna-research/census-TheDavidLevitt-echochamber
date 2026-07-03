@@ -1,0 +1,50 @@
+# Example batch configuration for EchoChamber
+# Run with: python -m echochamber.batch --config runs_example.yaml
+
+# Base configuration applied to all runs
+base:
+  topic: "Python vs Rust for High-Performance Data Processing"
+  position: "Rust should be chosen for the new data processing system"
+  case_folder: "cases/example_case"
+  max_rounds: 3
+
+# Individual run variations
+runs:
+  # All local (free)
+  - name: "local-all"
+    prosecution_provider: "lmstudio"
+    defense_provider: "lmstudio"
+    moderator_provider: "lmstudio"
+
+  # All Gemini (cheap)
+  - name: "gemini-all"
+    prosecution_provider: "gemini"
+    defense_provider: "gemini"
+    moderator_provider: "gemini"
+
+  # Together advocates, DeepSeek R1 moderator
+  - name: "together-deepseek"
+    prosecution_provider: "together"
+    prosecution_model: "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo"
+    defense_provider: "together"
+    defense_model: "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo"
+    moderator_provider: "together"
+    moderator_model: "deepseek-ai/DeepSeek-R1"
+
+  # Claude Sonnet for all (quality benchmark)
+  - name: "claude-sonnet-all"
+    prosecution_provider: "anthropic"
+    prosecution_model: "claude-sonnet-4-20250514"
+    defense_provider: "anthropic"
+    defense_model: "claude-sonnet-4-20250514"
+    moderator_provider: "anthropic"
+    moderator_model: "claude-sonnet-4-20250514"
+
+  # Claude Opus moderator (premium)
+  - name: "together-claude-opus-mod"
+    prosecution_provider: "together"
+    prosecution_model: "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo"
+    defense_provider: "together"
+    defense_model: "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo"
+    moderator_provider: "anthropic"
+    moderator_model: "claude-opus-4-20250514"
