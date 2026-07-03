@@ -28,10 +28,14 @@ import stat
 import threading
 from pathlib import Path
 
+# The module stays importable without gradio (key helpers are GUI-independent
+# and the test suite imports them); only building/launching the app needs it.
 try:
     import gradio as gr
 except ImportError:  # pragma: no cover
-    raise SystemExit("The GUI requires gradio. Install with: uv sync --extra ui")
+    gr = None
+
+_GRADIO_MISSING = "The GUI requires gradio. Install with: uv sync --extra ui"
 
 # Load .env file if present
 try:
@@ -461,6 +465,8 @@ def _setup_tab():
 
 
 def build_app() -> "gr.Blocks":
+    if gr is None:  # pragma: no cover
+        raise SystemExit(_GRADIO_MISSING)
     with gr.Blocks(title="EchoChamber", head=_HEAD_JS) as app:
         gr.Markdown("# ⚖️ EchoChamber — Multi-LLM Courtroom Debate")
         with gr.Tab("Debate"):
