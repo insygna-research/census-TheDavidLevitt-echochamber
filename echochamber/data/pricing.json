@@ -1,0 +1,23 @@
+{
+  "_comment": "USD per 1M tokens (in = input, out = output). Update as prices change; keys are matched by substring so model-version suffixes still resolve. Field names match agent-stable's pricing table shape.",
+  "models": {
+    "claude-opus-4-20250514": { "in": 15.0, "out": 75.0, "name": "Claude Opus 4" },
+    "claude-sonnet-4-20250514": { "in": 3.0, "out": 15.0, "name": "Claude Sonnet 4" },
+    "claude-haiku-3-5-20241022": { "in": 0.25, "out": 1.25, "name": "Claude Haiku 3.5" },
+
+    "gpt-4o": { "in": 2.5, "out": 10.0, "name": "GPT-4o" },
+    "gpt-4o-mini": { "in": 0.15, "out": 0.6, "name": "GPT-4o Mini" },
+    "gpt-4-turbo": { "in": 10.0, "out": 30.0, "name": "GPT-4 Turbo" },
+
+    "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo": { "in": 3.5, "out": 3.5, "name": "Llama 3.1 405B" },
+    "meta-llama/Llama-3-70b-chat-hf": { "in": 0.9, "out": 0.9, "name": "Llama 3 70B" },
+    "deepseek-ai/DeepSeek-R1": { "in": 3.0, "out": 7.0, "name": "DeepSeek R1" },
+    "deepseek-ai/DeepSeek-V3": { "in": 0.5, "out": 1.0, "name": "DeepSeek V3" },
+
+    "gemini-2.0-flash": { "in": 0.1, "out": 0.4, "name": "Gemini 2.0 Flash" },
+    "gemini-1.5-pro": { "in": 1.25, "out": 5.0, "name": "Gemini 1.5 Pro" },
+    "gemini-1.5-flash": { "in": 0.075, "out": 0.3, "name": "Gemini 1.5 Flash" },
+
+    "local-model": { "in": 0.0, "out": 0.0, "name": "Local Model" }
+  }
+}

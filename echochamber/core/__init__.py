@@ -12,8 +12,17 @@ from .preprocessor import (
     create_summarizer_from_provider,
 )
 from .costs import estimate_run_cost, format_cost_estimate, get_model_pricing
+from .runner import DebateSpec, DebateOutcome, run_debate
+from .turns import run_agent_turn
+from .usage import UsageEvent, UsageMeter
 
 __all__ = [
+    "DebateSpec",
+    "DebateOutcome",
+    "run_debate",
+    "run_agent_turn",
+    "UsageEvent",
+    "UsageMeter",
     "Agent",
     "Role",
     "ModeratorDecision",

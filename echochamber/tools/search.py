@@ -10,6 +10,29 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Optional
 
+from ..providers.base import ToolDef
+
+# Native tool definition, for providers that support tool calling.
+# Providers that don't are driven via the [SEARCH: query] sentinel below.
+WEB_SEARCH_TOOL = ToolDef(
+    name="web_search",
+    description=(
+        "Search the web for evidence, data, precedents, or expert opinions. "
+        "Returns titles, snippets, and source URLs. You have a limited search "
+        "budget per turn, so choose impactful queries."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The search query",
+            },
+        },
+        "required": ["query"],
+    },
+)
+
 
 def normalize_query(query: str) -> str:
     """

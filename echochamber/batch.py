@@ -2,6 +2,9 @@
 """
 EchoChamber Batch Runner - Run multiple debate variations simultaneously.
 
+Runs happen in-process on a thread pool (debate turns are sequential API
+calls, so threads waiting on I/O parallelize cleanly across runs).
+
 Usage:
     python -m echochamber.batch --config runs.yaml
     python -m echochamber.batch --topic "Topic" --variations providers
@@ -10,12 +13,10 @@ Usage:
 import argparse
 import sys
 import json
-import subprocess
 import concurrent.futures
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-import threading
 import time
 
 # Load .env file if present
@@ -26,23 +27,13 @@ except ImportError:
     pass
 
 from .core.costs import estimate_run_cost, format_cost_estimate, get_model_pricing
-
-# Default models by provider and role
-DEFAULT_ADVOCATE_MODELS = {
-    "anthropic": "claude-sonnet-4-20250514",
-    "openai": "gpt-4o",
-    "together": "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo",
-    "gemini": "gemini-2.0-flash",
-    "lmstudio": "local-model",
-}
-
-DEFAULT_MODERATOR_MODELS = {
-    "anthropic": "claude-sonnet-4-20250514",
-    "openai": "gpt-4o",
-    "together": "deepseek-ai/DeepSeek-R1",
-    "gemini": "gemini-2.0-flash",
-    "lmstudio": "local-model",
-}
+from .core.runner import (
+    DEFAULT_MODELS as DEFAULT_ADVOCATE_MODELS,
+    DEFAULT_MODERATOR_MODELS,
+    DebateSpec,
+    run_debate,
+)
+from .core.session import TerminationReason
 
 
 @dataclass
@@ -59,7 +50,6 @@ class RunVariation:
     moderator_model: Optional[str] = None
     max_rounds: int = 3
     case_folder: Optional[str] = None
-    extra_args: list = field(default_factory=list)
 
     def resolve_models(self):
         """Resolve model names from provider defaults."""
@@ -81,25 +71,23 @@ class RunVariation:
             evidence_tokens,
         )
 
-    def to_cli_args(self) -> list[str]:
-        """Convert to CLI arguments."""
+    def to_spec(self, output_dir: Path) -> DebateSpec:
+        """Convert to a runnable DebateSpec (quiet, transcripts to output_dir)."""
         self.resolve_models()
-        args = [
-            sys.executable, "-m", "echochamber.cli",
-            "--topic", self.topic,
-            "--position", self.position,
-            "--prosecution-provider", self.prosecution_provider,
-            "--prosecution-model", self.prosecution_model,
-            "--defense-provider", self.defense_provider,
-            "--defense-model", self.defense_model,
-            "--moderator-provider", self.moderator_provider,
-            "--moderator-model", self.moderator_model,
-            "--max-rounds", str(self.max_rounds),
-        ]
-        if self.case_folder:
-            args.extend(["--case-folder", self.case_folder])
-        args.extend(self.extra_args)
-        return args
+        return DebateSpec(
+            topic=self.topic,
+            position=self.position,
+            prosecution_provider=self.prosecution_provider,
+            prosecution_model=self.prosecution_model,
+            defense_provider=self.defense_provider,
+            defense_model=self.defense_model,
+            moderator_provider=self.moderator_provider,
+            moderator_model=self.moderator_model,
+            max_rounds=self.max_rounds,
+            case_folder=self.case_folder,
+            verbose=False,
+            transcript_dir=str(output_dir),
+        )
 
 
 def generate_provider_variations(
@@ -199,42 +187,30 @@ def load_config(config_path: str) -> list[RunVariation]:
 
 
 def run_single_variation(variation: RunVariation, output_dir: Path) -> dict:
-    """Run a single variation and return the result."""
-    args = variation.to_cli_args()
-    args.extend(["--transcript-dir", str(output_dir)])
-
+    """Run a single variation in-process and return the result."""
     start_time = time.time()
     try:
-        result = subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            timeout=3600,  # 1 hour timeout
-        )
-        elapsed = time.time() - start_time
-
+        outcome = run_debate(variation.to_spec(output_dir))
         return {
             "name": variation.name,
-            "success": result.returncode == 0,
-            "elapsed": elapsed,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-        }
-    except subprocess.TimeoutExpired:
-        return {
-            "name": variation.name,
-            "success": False,
-            "elapsed": 3600,
-            "stdout": "",
-            "stderr": "Timeout after 1 hour",
+            "success": outcome.result.termination_reason != TerminationReason.ERROR,
+            "elapsed": time.time() - start_time,
+            "winner": outcome.result.winner or "undecided",
+            "rounds": outcome.result.rounds_completed,
+            "cost_usd": outcome.usage.total_cost(),
+            "transcript": str(outcome.transcript_path or ""),
+            "error": "",
         }
     except Exception as e:
         return {
             "name": variation.name,
             "success": False,
             "elapsed": time.time() - start_time,
-            "stdout": "",
-            "stderr": str(e),
+            "winner": "",
+            "rounds": 0,
+            "cost_usd": 0.0,
+            "transcript": "",
+            "error": str(e),
         }
 
 
@@ -292,6 +268,14 @@ def run_batch(
     output_dir.mkdir(parents=True, exist_ok=True)
     results = []
 
+    def describe(result: dict) -> str:
+        if not result["success"]:
+            return f"failed: {result['error'] or 'session error'}"
+        return (
+            f"winner: {result['winner']}, {result['rounds']} rounds, "
+            f"${result['cost_usd']:.4f} actual"
+        )
+
     if parallel > 1:
         print(f"\nRunning {len(variations)} variations ({parallel} in parallel)...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=parallel) as executor:
@@ -303,7 +287,7 @@ def run_batch(
                 result = future.result()
                 results.append(result)
                 status = "✓" if result["success"] else "✗"
-                print(f"  {status} {result['name']} ({result['elapsed']:.1f}s)")
+                print(f"  {status} {result['name']} ({result['elapsed']:.1f}s, {describe(result)})")
     else:
         print(f"\nRunning {len(variations)} variations sequentially...")
         for i, var in enumerate(variations, 1):
@@ -311,12 +295,14 @@ def run_batch(
             result = run_single_variation(var, output_dir)
             results.append(result)
             status = "✓" if result["success"] else "✗"
-            print(f"  {status} Completed in {result['elapsed']:.1f}s")
+            print(f"  {status} Completed in {result['elapsed']:.1f}s ({describe(result)})")
 
     # Summary
     successful = sum(1 for r in results if r["success"])
+    total_actual = sum(r["cost_usd"] for r in results)
     print("\n" + "=" * 60)
     print(f"BATCH COMPLETE: {successful}/{len(results)} succeeded")
+    print(f"Actual cost: ${total_actual:.4f}")
     print("=" * 60)
 
     return results

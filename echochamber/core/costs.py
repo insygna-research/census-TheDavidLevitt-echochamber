@@ -1,6 +1,12 @@
-"""Cost estimation for LLM API calls."""
+"""Cost estimation for LLM API calls.
 
+Prices live in data/pricing.json (a human-editable data file) rather than
+in code, so updating them never touches logic.
+"""
+
+import json
 from dataclasses import dataclass
+from importlib import resources
 from typing import Optional
 
 
@@ -12,33 +18,21 @@ class ModelPricing:
     name: str = ""
 
 
-# Pricing as of early 2025 (USD per million tokens)
-# Update these as prices change
-MODEL_PRICING = {
-    # Anthropic
-    "claude-opus-4-20250514": ModelPricing(15.0, 75.0, "Claude Opus 4"),
-    "claude-sonnet-4-20250514": ModelPricing(3.0, 15.0, "Claude Sonnet 4"),
-    "claude-haiku-3-5-20241022": ModelPricing(0.25, 1.25, "Claude Haiku 3.5"),
+def _load_pricing() -> dict[str, ModelPricing]:
+    raw = json.loads(
+        resources.files("echochamber.data").joinpath("pricing.json").read_text()
+    )
+    return {
+        model: ModelPricing(
+            input_per_million=float(p["in"]),
+            output_per_million=float(p["out"]),
+            name=p.get("name", model),
+        )
+        for model, p in raw["models"].items()
+    }
 
-    # OpenAI
-    "gpt-4o": ModelPricing(2.5, 10.0, "GPT-4o"),
-    "gpt-4o-mini": ModelPricing(0.15, 0.60, "GPT-4o Mini"),
-    "gpt-4-turbo": ModelPricing(10.0, 30.0, "GPT-4 Turbo"),
 
-    # Together.AI (approximate)
-    "meta-llama/Meta-Llama-3.1-405B-Instruct-Turbo": ModelPricing(3.5, 3.5, "Llama 3.1 405B"),
-    "meta-llama/Llama-3-70b-chat-hf": ModelPricing(0.9, 0.9, "Llama 3 70B"),
-    "deepseek-ai/DeepSeek-R1": ModelPricing(3.0, 7.0, "DeepSeek R1"),
-    "deepseek-ai/DeepSeek-V3": ModelPricing(0.5, 1.0, "DeepSeek V3"),
-
-    # Google Gemini
-    "gemini-2.0-flash": ModelPricing(0.10, 0.40, "Gemini 2.0 Flash"),
-    "gemini-1.5-pro": ModelPricing(1.25, 5.0, "Gemini 1.5 Pro"),
-    "gemini-1.5-flash": ModelPricing(0.075, 0.30, "Gemini 1.5 Flash"),
-
-    # Local (free)
-    "local-model": ModelPricing(0.0, 0.0, "Local Model"),
-}
+MODEL_PRICING = _load_pricing()
 
 
 def get_model_pricing(model: str) -> Optional[ModelPricing]:

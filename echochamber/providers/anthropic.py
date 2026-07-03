@@ -1,13 +1,17 @@
 """Anthropic Claude provider."""
 
 import os
+import time
 from typing import Optional
 
-from .base import LLMProvider, LLMResponse, Message
+from .base import LLMProvider, LLMResponse, Message, ToolCall, ToolDef
+from .retry import call_with_retries
 
 
 class AnthropicProvider(LLMProvider):
     """Provider for Anthropic's Claude models."""
+
+    supports_tools = True
 
     def __init__(
         self,
@@ -28,44 +32,97 @@ class AnthropicProvider(LLMProvider):
         except ImportError:
             raise ImportError("Please install anthropic: pip install anthropic")
 
+    def _to_wire(self, messages: list[Message]) -> list[dict]:
+        """Convert to Anthropic format.
+
+        Assistant tool calls become tool_use content blocks; tool results
+        become tool_result blocks in a user message. Consecutive tool results
+        are merged into one user message, as the API requires all results for
+        a turn's tool_use blocks to arrive together.
+        """
+        wire = []
+        for msg in messages:
+            if msg.role == "system":
+                continue  # Anthropic handles system separately
+            if msg.role == "assistant" and msg.tool_calls:
+                blocks = []
+                if msg.content:
+                    blocks.append({"type": "text", "text": msg.content})
+                for tc in msg.tool_calls:
+                    blocks.append({
+                        "type": "tool_use",
+                        "id": tc.id,
+                        "name": tc.name,
+                        "input": tc.arguments,
+                    })
+                wire.append({"role": "assistant", "content": blocks})
+            elif msg.role == "tool":
+                result_block = {
+                    "type": "tool_result",
+                    "tool_use_id": msg.tool_call_id,
+                    "content": msg.content,
+                }
+                if wire and wire[-1]["role"] == "user" and isinstance(wire[-1]["content"], list):
+                    wire[-1]["content"].append(result_block)
+                else:
+                    wire.append({"role": "user", "content": [result_block]})
+            else:
+                wire.append({"role": msg.role, "content": msg.content})
+        return wire
+
     def complete(
         self,
         messages: list[Message],
         system_prompt: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: int = 1024,
+        tools: Optional[list[ToolDef]] = None,
+        tool_choice: Optional[str] = None,
     ) -> LLMResponse:
-        # Convert to Anthropic format
-        anthropic_messages = []
-        for msg in messages:
-            if msg.role == "system":
-                # Anthropic handles system separately
-                continue
-            anthropic_messages.append({
-                "role": msg.role,
-                "content": msg.content,
-            })
-
-        # Build request
         kwargs = {
             "model": self.model,
             "max_tokens": max_tokens,
             "temperature": temperature,
-            "messages": anthropic_messages,
+            "messages": self._to_wire(messages),
         }
         if system_prompt:
             kwargs["system"] = system_prompt
+        if tools:
+            kwargs["tools"] = [
+                {
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.parameters,
+                }
+                for t in tools
+            ]
+            if tool_choice:
+                kwargs["tool_choice"] = {"type": "tool", "name": tool_choice}
 
-        response = self.client.messages.create(**kwargs)
+        start = time.time()
+        response = call_with_retries(lambda: self.client.messages.create(**kwargs))
+        latency_ms = (time.time() - start) * 1000
+
+        text_parts = []
+        tool_calls = []
+        for block in response.content:
+            if block.type == "text":
+                text_parts.append(block.text)
+            elif block.type == "tool_use":
+                tool_calls.append(
+                    ToolCall(id=block.id, name=block.name, arguments=dict(block.input))
+                )
 
         return LLMResponse(
-            content=response.content[0].text,
+            content="\n".join(text_parts),
             model=response.model,
             usage={
                 "input_tokens": response.usage.input_tokens,
                 "output_tokens": response.usage.output_tokens,
             },
             raw_response=response.model_dump(),
+            tool_calls=tool_calls,
+            latency_ms=latency_ms,
         )
 
     @property

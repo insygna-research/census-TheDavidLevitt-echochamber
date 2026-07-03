@@ -1,17 +1,16 @@
 """Court session orchestrator."""
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Callable
-
-from typing import Union
+from typing import Optional, Callable, Union
 
 from .agent import Agent, Role
 from .transcript import Transcript
 from .evidence import EvidenceStore
 from .preprocessor import ProcessedEvidenceStore, ContextStrategy
-from ..providers import Message
+from .turns import run_agent_turn
+from ..providers import Message, ToolDef
 
 
 class TerminationReason(Enum):
@@ -41,6 +40,57 @@ class SessionResult:
     rounds_completed: int = 0
 
 
+# Structured decision tools for the moderator. Providers without tool
+# support fall back to the CONTINUE:/WINNER:/FINAL VERDICT: text protocol.
+EVALUATION_TOOL = ToolDef(
+    name="submit_evaluation",
+    description="Submit your evaluation of the round that just concluded.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "continue_debate": {
+                "type": "boolean",
+                "description": (
+                    "False only if one side has clearly won, both sides are "
+                    "repeating themselves, or the debate has reached a natural "
+                    "conclusion."
+                ),
+            },
+            "winner": {
+                "type": "string",
+                "enum": ["prosecution", "defense", "none"],
+                "description": "Side with the stronger case so far; none if too close to call.",
+            },
+            "reasoning": {
+                "type": "string",
+                "description": "Your evaluation of the arguments presented this round.",
+            },
+        },
+        "required": ["continue_debate", "winner", "reasoning"],
+    },
+)
+
+VERDICT_TOOL = ToolDef(
+    name="submit_verdict",
+    description="Submit your final ruling for the debate.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "winner": {
+                "type": "string",
+                "enum": ["prosecution", "defense", "draw"],
+                "description": "The side that made the stronger case, or draw.",
+            },
+            "reasoning": {
+                "type": "string",
+                "description": "Your complete final ruling and summary of the proceedings.",
+            },
+        },
+        "required": ["winner", "reasoning"],
+    },
+)
+
+
 class CourtSession:
     """
     Orchestrates a courtroom debate between LLM agents.
@@ -58,6 +108,7 @@ class CourtSession:
         evidence: Optional[Union[EvidenceStore, ProcessedEvidenceStore]] = None,
         on_turn: Optional[Callable[[str, str, str], None]] = None,
         search_tool: Optional[object] = None,
+        max_searches_per_turn: int = 0,
         max_moderator_searches: int = 0,
     ):
         """
@@ -70,8 +121,9 @@ class CourtSession:
             config: Session configuration
             evidence: Optional evidence store (raw or processed) with case documents
             on_turn: Callback(speaker, role, content) after each turn
-            search_tool: Optional WebSearchTool for moderator searches during final ruling
-            max_moderator_searches: Maximum searches allowed for moderator (0 = disabled)
+            search_tool: Optional WebSearchTool available to agents during turns
+            max_searches_per_turn: Search budget per advocate turn (0 = disabled)
+            max_moderator_searches: Search budget for the moderator (0 = disabled)
         """
         if prosecution.role != Role.PROSECUTION:
             raise ValueError("Prosecution agent must have PROSECUTION role")
@@ -87,6 +139,7 @@ class CourtSession:
         self.evidence = evidence
         self.on_turn = on_turn
         self.search_tool = search_tool
+        self.max_searches_per_turn = max_searches_per_turn
         self.max_moderator_searches = max_moderator_searches
 
         # Track if using processed evidence for RAG queries
@@ -159,7 +212,9 @@ The debate ends when:
                 self._log(f"\n=== ROUND {round_num} ===\n")
 
                 # Prosecution argues
-                prosecution_response = self._get_prosecution_argument(case_context, round_num)
+                prosecution_response = self._get_advocate_argument(
+                    self.prosecution, case_context, round_num
+                )
                 self._record_turn(
                     self.prosecution.name, "prosecution", prosecution_response, round_num
                 )
@@ -171,7 +226,9 @@ The debate ends when:
                     break
 
                 # Defense responds
-                defense_response = self._get_defense_argument(case_context, round_num)
+                defense_response = self._get_advocate_argument(
+                    self.defense, case_context, round_num
+                )
                 self._record_turn(
                     self.defense.name, "defense", defense_response, round_num
                 )
@@ -268,8 +325,8 @@ The debate ends when:
         ]
         return self.moderator.respond(messages)
 
-    def _get_prosecution_argument(self, case_context: str, round_num: int) -> str:
-        """Get prosecution's argument for this round."""
+    def _get_advocate_argument(self, agent: Agent, case_context: str, round_num: int) -> str:
+        """Get an advocate's argument for this round, searches included."""
         history = self.transcript.get_conversation_history()
 
         # For RAG, use recent context as query
@@ -279,47 +336,42 @@ The debate ends when:
             recent = [m.content for m in history[-4:]]
             rag_query = " ".join(recent)[:1000]
 
-        context = self._get_evidence_context_for_role(Role.PROSECUTION, case_context, query=rag_query)
+        context = self._get_evidence_context_for_role(agent.role, case_context, query=rag_query)
 
         concession_note = ""
         if self.config.allow_concession:
             concession_note = '\nIf you believe your position is untenable, you may concede by explicitly stating "I CONCEDE" in your response.'
 
-        instruction = f"""
-{context}
-
-This is round {round_num}. Present your arguments for your position.
-{"This is your opening argument. Establish your main points." if round_num == 1 else "Build on your previous arguments and respond to the defense's points."}
-{concession_note}
-"""
-        messages = history + [Message(role="user", content=instruction)]
-        return self.prosecution.respond(messages)
-
-    def _get_defense_argument(self, case_context: str, round_num: int) -> str:
-        """Get defense's argument for this round."""
-        history = self.transcript.get_conversation_history()
-
-        # For RAG, use recent context as query
-        rag_query = None
-        if self._use_rag and history:
-            recent = [m.content for m in history[-4:]]
-            rag_query = " ".join(recent)[:1000]
-
-        context = self._get_evidence_context_for_role(Role.DEFENSE, case_context, query=rag_query)
-
-        concession_note = ""
-        if self.config.allow_concession:
-            concession_note = '\nIf you believe your position is untenable, you may concede by explicitly stating "I CONCEDE" in your response.'
+        if agent.role == Role.PROSECUTION:
+            turn_note = (
+                "This is your opening argument. Establish your main points."
+                if round_num == 1
+                else "Build on your previous arguments and respond to the defense's points."
+            )
+            action = "Present your arguments for your position."
+        else:
+            turn_note = (
+                "This is your opening response. Address the prosecution's main points and establish your defense."
+                if round_num == 1
+                else "Continue your defense and address new points raised by prosecution."
+            )
+            action = "Present your counter-arguments."
 
         instruction = f"""
 {context}
 
-This is round {round_num}. Present your counter-arguments.
-{"This is your opening response. Address the prosecution's main points and establish your defense." if round_num == 1 else "Continue your defense and address new points raised by prosecution."}
+This is round {round_num}. {action}
+{turn_note}
 {concession_note}
 """
         messages = history + [Message(role="user", content=instruction)]
-        return self.defense.respond(messages)
+        return run_agent_turn(
+            agent,
+            messages,
+            search_tool=self.search_tool,
+            max_searches=self.max_searches_per_turn,
+            log=self._log,
+        )
 
     def _get_moderator_evaluation(
         self, case_context: str, round_num: int
@@ -333,6 +385,12 @@ This is round {round_num}. Present your counter-arguments.
         context = self._get_evidence_context_for_role(Role.MODERATOR, case_context)
         history = self.transcript.get_conversation_history()
 
+        if self.moderator.provider.supports_tools:
+            result = self._structured_evaluation(context, history, round_num)
+            if result is not None:
+                return result
+
+        # Text protocol fallback
         instruction = f"""
 {context}
 
@@ -367,6 +425,42 @@ Set WINNER to the side that has made the stronger case so far, or NONE if it's t
 
         return should_continue, winner, response
 
+    def _structured_evaluation(
+        self, context: str, history: list[Message], round_num: int
+    ) -> Optional[tuple[bool, Optional[str], str]]:
+        """Round evaluation via the submit_evaluation tool. None on failure."""
+        instruction = f"""
+{context}
+
+Round {round_num} has concluded. Evaluate the arguments presented, then
+submit your evaluation with the submit_evaluation tool.
+
+End the debate (continue_debate = false) only if:
+- One side has clearly won and further debate would be pointless
+- Both sides are repeating arguments without progress
+- The debate has reached a natural conclusion
+"""
+        messages = history + [Message(role="user", content=instruction)]
+        try:
+            response = self.moderator.respond_full(
+                messages, tools=[EVALUATION_TOOL], tool_choice="submit_evaluation"
+            )
+        except Exception as e:
+            self._log(f"  [structured evaluation failed ({e}); using text protocol]")
+            return None
+
+        call = next(
+            (tc for tc in response.tool_calls if tc.name == "submit_evaluation"), None
+        )
+        if not call:
+            return None
+
+        winner = call.arguments.get("winner")
+        if winner not in ("prosecution", "defense"):
+            winner = None
+        reasoning = str(call.arguments.get("reasoning", "")) or response.content
+        return bool(call.arguments.get("continue_debate", True)), winner, reasoning
+
     def _get_final_ruling(
         self,
         case_context: str,
@@ -384,7 +478,14 @@ Set WINNER to the side that has made the stronger case so far, or NONE if it's t
         context = self._get_evidence_context_for_role(Role.MODERATOR, case_context)
         history = self.transcript.get_conversation_history()
 
-        # If no winner yet, ask moderator to decide
+        if self.moderator.provider.supports_tools:
+            structured = self._structured_ruling(
+                context, history, termination_reason, winner
+            )
+            if structured is not None:
+                return structured
+
+        # Text protocol fallback
         if winner:
             winner_instruction = f"Winner: {winner}"
         else:
@@ -420,22 +521,110 @@ Please provide your final ruling and summary of the proceedings.
         if self.search_tool and self.max_moderator_searches > 0:
             ruling = self._process_ruling_searches(ruling, messages)
 
-        # Extract winner from ruling if not already set
-        final_winner = winner
-        if not final_winner:
-            ruling_upper = ruling.upper()
-            if "FINAL VERDICT: PROSECUTION WINS" in ruling_upper or "PROSECUTION WINS" in ruling_upper:
-                final_winner = "prosecution"
-            elif "FINAL VERDICT: DEFENSE WINS" in ruling_upper or "DEFENSE WINS" in ruling_upper:
-                final_winner = "defense"
-            elif "FINAL VERDICT: DRAW" in ruling_upper:
-                final_winner = "draw"
+        return ruling, self._extract_winner_from_ruling(ruling, winner)
 
-        return ruling, final_winner
+    def _structured_ruling(
+        self,
+        context: str,
+        history: list[Message],
+        termination_reason: TerminationReason,
+        winner: Optional[str],
+    ) -> Optional[tuple[str, Optional[str]]]:
+        """Final ruling via native tools. None on failure.
+
+        The moderator may search the web (within budget) and must close with
+        the submit_verdict tool.
+        """
+        from ..tools.search import WEB_SEARCH_TOOL
+
+        can_search = self.search_tool is not None and self.max_moderator_searches > 0
+        winner_note = (
+            f"A winner has already been determined: {winner}. Your ruling should explain the outcome."
+            if winner
+            else "No winner has been determined yet — your verdict decides."
+        )
+        search_note = (
+            " Verify key legal or factual claims with the web_search tool before ruling."
+            if can_search
+            else ""
+        )
+        instruction = f"""
+{context}
+
+The debate has concluded (reason: {termination_reason.value}). {winner_note}{search_note}
+When ready, submit your complete final ruling with the submit_verdict tool.
+"""
+        convo = history + [Message(role="user", content=instruction)]
+        searches_used = 0
+
+        try:
+            for _ in range(self.max_moderator_searches + 2):
+                if can_search and searches_used < self.max_moderator_searches:
+                    tools, tool_choice = [WEB_SEARCH_TOOL, VERDICT_TOOL], None
+                else:
+                    tools, tool_choice = [VERDICT_TOOL], "submit_verdict"
+                response = self.moderator.respond_full(
+                    convo, tools=tools, tool_choice=tool_choice
+                )
+
+                verdict_call = next(
+                    (tc for tc in response.tool_calls if tc.name == "submit_verdict"),
+                    None,
+                )
+                if verdict_call:
+                    v = verdict_call.arguments.get("winner")
+                    final_winner = winner or (
+                        v if v in ("prosecution", "defense", "draw") else None
+                    )
+                    ruling = str(verdict_call.arguments.get("reasoning", "")) or response.content
+                    return ruling, final_winner
+
+                if not response.tool_calls:
+                    # Plain text ruling despite the tool being offered
+                    return response.content, self._extract_winner_from_ruling(
+                        response.content, winner
+                    )
+
+                convo.append(Message(
+                    role="assistant",
+                    content=response.content,
+                    tool_calls=response.tool_calls,
+                ))
+                for tc in response.tool_calls:
+                    if tc.name == "web_search" and searches_used < self.max_moderator_searches:
+                        query = str(tc.arguments.get("query", "")).strip()
+                        searches_used += 1
+                        self._log(
+                            f"  [Moderator searching ({searches_used}/{self.max_moderator_searches}): {query}]"
+                        )
+                        result = self.search_tool.search_formatted(query, max_results=3)
+                    else:
+                        result = "Search budget exhausted. Submit your verdict now."
+                    convo.append(Message(role="tool", content=result, tool_call_id=tc.id))
+        except Exception as e:
+            self._log(f"  [structured ruling failed ({e}); using text protocol]")
+            return None
+
+        return None
+
+    def _extract_winner_from_ruling(
+        self, ruling: str, current_winner: Optional[str]
+    ) -> Optional[str]:
+        """Extract a winner from ruling text if one isn't already decided."""
+        if current_winner:
+            return current_winner
+        ruling_upper = ruling.upper()
+        if "FINAL VERDICT: PROSECUTION WINS" in ruling_upper or "PROSECUTION WINS" in ruling_upper:
+            return "prosecution"
+        if "FINAL VERDICT: DEFENSE WINS" in ruling_upper or "DEFENSE WINS" in ruling_upper:
+            return "defense"
+        if "FINAL VERDICT: DRAW" in ruling_upper:
+            return "draw"
+        return None
 
     def _process_ruling_searches(self, ruling: str, messages: list[Message]) -> str:
         """
-        Process search requests in the moderator's ruling.
+        Process search requests in the moderator's ruling (text protocol).
 
         If the ruling contains [SEARCH: query] tags, perform the searches
         and ask the moderator to provide a final ruling with the results.

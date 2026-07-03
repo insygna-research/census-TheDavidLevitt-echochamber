@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 from enum import Enum
 
-from ..providers import LLMProvider, Message, LLMResponse
+from ..providers import LLMProvider, Message, LLMResponse, ToolDef
 
 
 class Role(Enum):
@@ -34,22 +34,27 @@ class Agent:
     system_prompt: str = ""
     temperature: float = 0.7
     max_tokens: int = 1024
+    meter: Optional[object] = None  # UsageMeter; every call is recorded if set
     _conversation_history: list[Message] = field(default_factory=list, repr=False)
 
-    def respond(
+    def respond_full(
         self,
         conversation: list[Message],
         additional_context: Optional[str] = None,
-    ) -> str:
+        tools: Optional[list[ToolDef]] = None,
+        tool_choice: Optional[str] = None,
+    ) -> LLMResponse:
         """
-        Generate a response given the conversation history.
+        Generate a response, returning the full LLMResponse (tool calls, usage).
 
         Args:
             conversation: Full conversation history visible to this agent
             additional_context: Optional context to prepend to system prompt
+            tools: Tools the agent may call (requires provider tool support)
+            tool_choice: Name of a tool the agent must call
 
         Returns:
-            Agent's response text
+            The provider's normalized LLMResponse
         """
         # Build effective system prompt
         system = self.system_prompt
@@ -61,9 +66,28 @@ class Agent:
             system_prompt=system,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
+            tools=tools,
+            tool_choice=tool_choice,
         )
 
-        return response.content
+        if self.meter:
+            self.meter.record(
+                module=f"debate.{self.role.value}",
+                provider=self.provider.name,
+                model=getattr(self.provider, "model", response.model),
+                usage=response.usage,
+                latency_ms=response.latency_ms,
+            )
+
+        return response
+
+    def respond(
+        self,
+        conversation: list[Message],
+        additional_context: Optional[str] = None,
+    ) -> str:
+        """Generate a response and return just its text."""
+        return self.respond_full(conversation, additional_context).content
 
     def __str__(self) -> str:
         return f"{self.name} ({self.role.value}) - {self.provider.name}"

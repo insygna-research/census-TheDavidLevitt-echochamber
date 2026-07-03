@@ -1,6 +1,7 @@
 """LLM Providers for EchoChamber."""
 
-from .base import LLMProvider, LLMResponse, Message
+from .base import LLMProvider, LLMResponse, Message, ToolCall, ToolDef
+from .retry import call_with_retries
 from .anthropic import AnthropicProvider
 from .openai import OpenAIProvider
 from .together import TogetherProvider
@@ -48,6 +49,9 @@ __all__ = [
     "LLMProvider",
     "LLMResponse",
     "Message",
+    "ToolCall",
+    "ToolDef",
+    "call_with_retries",
     "AnthropicProvider",
     "OpenAIProvider",
     "TogetherProvider",
