@@ -53,6 +53,13 @@ def test_side_balanced_scoring(tmp_path):
     sides = [m["candidate_side"] for m in report["matchups"]]
     assert sides == ["prosecution", "defense", "prosecution", "defense"]
 
+    # Verboseness: FakeProvider emits 50 output tokens/call for both sides
+    v = report["verbosity"]
+    assert v["candidate_output_tokens"] == v["incumbent_output_tokens"] == 200
+    assert v["ratio"] == 1.0
+    assert v["candidate_tokens_per_win"] == 100  # 200 tokens over 2 wins
+    assert v["incumbent_tokens_per_win"] == 100
+
 
 def test_apa_finding_shape(tmp_path):
     config = make_config()
@@ -64,6 +71,7 @@ def test_apa_finding_shape(tmp_path):
     assert finding["lab"] == "cand"
     assert finding["model"] == "candidate-x"
     assert "1W/1L" in finding["headline"]
+    assert "Verbosity" in finding["why"]
 
 
 def test_default_topics_are_well_formed():
