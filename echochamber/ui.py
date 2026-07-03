@@ -5,12 +5,28 @@ EchoChamber GUI - watch a debate live in the browser.
     uv run python -m echochamber.ui          # http://localhost:7860
 
 Requires the ui extra:  uv sync --extra ui
+
+Two tabs:
+- Debate: run and watch debates (live agent/model status, token ticker,
+  stop button, APA model recommendations).
+- Setup: paste provider API keys, test them, and save to .env — no
+  terminal needed.
+
+Closing the tab while a debate runs triggers the browser's native leave
+warning; whether the debate then aborts or continues in the background is a
+user preference on the Debate tab (browsers do not allow custom dialogs on
+tab close). Backgrounded debates appear in the "Background runs" panel and
+still save their transcripts.
+
 Set $ECHOCHAMBER_APA_DATA to an APA data directory (or merged export) to see
 live procurement recommendations instead of the bundled sample.
 """
 
+import os
 import queue
+import stat
 import threading
+from pathlib import Path
 
 try:
     import gradio as gr
@@ -31,8 +47,29 @@ from .recommendations import load_apa_data, recommend_for_debate
 PROVIDERS = ["lmstudio", "anthropic", "openai", "together", "gemini"]
 ROLE_EMOJI = {"prosecution": "⚖️", "defense": "🛡️", "moderator": "👨‍⚖️", "system": "⚙️"}
 
-_run_lock = threading.Lock()
-_stop_event = threading.Event()
+PROVIDER_ENV_KEYS = {
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "together": "TOGETHER_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+}
+
+ENV_FILE = Path.cwd() / ".env"
+
+# The foreground run's stop event (single-user local app) and the run registry
+# for the background panel.
+_active_stop: dict = {"event": None}
+_runs: list[dict] = []
+
+# Warn (native browser dialog) when leaving while a debate is running.
+_HEAD_JS = """
+<script>
+window.__ec_running = false;
+window.addEventListener('beforeunload', (e) => {
+  if (window.__ec_running) { e.preventDefault(); e.returnValue = ''; }
+});
+</script>
+"""
 
 # APA recommendations, loaded once at startup
 try:
@@ -41,6 +78,8 @@ try:
 except Exception:
     _apa, _recs = None, {}
 
+
+# ---------------------------------------------------------------- APA panel
 
 def _recs_markdown() -> str:
     if not _recs or not any(_recs.values()):
@@ -70,6 +109,98 @@ def _apply_recs(rank: int):
     return out
 
 
+# ------------------------------------------------------------- key handling
+
+def _mask(value: str) -> str:
+    if not value:
+        return "not set"
+    if len(value) <= 12:
+        return "set (short key)"
+    return f"set ({value[:7]}…{value[-4:]})"
+
+
+def key_overview_md() -> str:
+    lines = ["| Provider | Env var | Status |", "|---|---|---|"]
+    for provider, env_key in PROVIDER_ENV_KEYS.items():
+        lines.append(f"| {provider} | `{env_key}` | {_mask(os.environ.get(env_key, ''))} |")
+    lines.append("| lmstudio | _(none needed)_ | local server on :1234 |")
+    lines.append(f"\nKeys are saved to `{ENV_FILE}` (owner-read-only) and loaded on launch.")
+    return "\n".join(lines)
+
+
+def test_provider_key(provider: str, key: str) -> str:
+    """Cheap auth check per provider (list-models style calls are free)."""
+    key = (key or "").strip() or os.environ.get(PROVIDER_ENV_KEYS.get(provider, ""), "")
+    try:
+        if provider == "lmstudio":
+            from .providers.lmstudio import get_lmstudio_model
+            model = get_lmstudio_model()
+            return f"✅ lmstudio: reachable, serving `{model}`" if model else \
+                "❌ lmstudio: no server on localhost:1234 (start LM Studio and load a model)"
+        if not key:
+            return f"❌ {provider}: no key entered or saved"
+        if provider == "anthropic":
+            import anthropic
+            anthropic.Anthropic(api_key=key).models.list(limit=1)
+        elif provider == "openai":
+            from openai import OpenAI
+            OpenAI(api_key=key).models.list()
+        elif provider == "together":
+            # Together's /models returns a bare array the OpenAI SDK can't
+            # parse; a raw authenticated GET is the reliable check.
+            import urllib.request
+            req = urllib.request.Request(
+                "https://api.together.xyz/v1/models",
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    # Together's edge rejects the default Python-urllib UA
+                    "User-Agent": "echochamber-setup-check",
+                },
+            )
+            urllib.request.urlopen(req, timeout=10)
+        elif provider == "gemini":
+            import google.generativeai as genai
+            genai.configure(api_key=key)
+            next(iter(genai.list_models()))
+        return f"✅ {provider}: key works"
+    except ImportError as e:
+        return f"❌ {provider}: SDK not installed ({e.name}) — run: uv sync --extra all"
+    except Exception as e:
+        return f"❌ {provider}: {str(e)[:200]}"
+
+
+def save_keys(anthropic_key: str, openai_key: str, together_key: str, gemini_key: str):
+    """Merge non-empty keys into .env (created owner-read-only) and the live env."""
+    new_values = {
+        "ANTHROPIC_API_KEY": anthropic_key.strip(),
+        "OPENAI_API_KEY": openai_key.strip(),
+        "TOGETHER_API_KEY": together_key.strip(),
+        "GEMINI_API_KEY": gemini_key.strip(),
+    }
+    new_values = {k: v for k, v in new_values.items() if v}
+    if not new_values:
+        return key_overview_md(), "Nothing to save — all fields empty."
+
+    lines = ENV_FILE.read_text().splitlines() if ENV_FILE.exists() else []
+    for env_key, value in new_values.items():
+        replaced = False
+        for i, line in enumerate(lines):
+            if line.strip().startswith(f"{env_key}="):
+                lines[i] = f"{env_key}={value}"
+                replaced = True
+                break
+        if not replaced:
+            lines.append(f"{env_key}={value}")
+        os.environ[env_key] = value  # effective immediately, no restart
+
+    ENV_FILE.write_text("\n".join(lines) + "\n")
+    ENV_FILE.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600
+    saved = ", ".join(new_values)
+    return key_overview_md(), f"✅ Saved {saved} to {ENV_FILE} (permissions 600). Empty fields were left unchanged."
+
+
+# ------------------------------------------------------------ debate running
+
 def _fmt_tokens(meter: UsageMeter, budget: int | None) -> str:
     tin, tout = meter.total_tokens()
     total = tin + tout
@@ -80,64 +211,86 @@ def _fmt_tokens(meter: UsageMeter, budget: int | None) -> str:
 
 
 def stop_debate():
-    _stop_event.set()
-    return "### ⏹️ Stopping after the current turn…"
+    event = _active_stop["event"]
+    if event:
+        event.set()
+        return "### ⏹️ Stopping after the current turn…"
+    return "### 💤 No debate running."
+
+
+def background_md() -> str:
+    detached = [r for r in _runs if r["detached"]][-5:]
+    if not detached:
+        return "_No background runs._"
+    lines = ["**Background runs** (tab was closed; debates kept going)\n"]
+    for r in detached:
+        tin, tout = r["meter"].total_tokens()
+        lines.append(f"- *{r['topic']}* — {r['status']} · {tin + tout:,} tokens, "
+                     f"${r['meter'].total_cost():.4f}" +
+                     (f" · `{r['transcript']}`" if r["transcript"] else ""))
+    return "\n".join(lines)
 
 
 def run_debate_ui(topic, position, pros_provider, pros_model, def_provider, def_model,
-                  mod_provider, mod_model, rounds, enable_search, token_budget):
+                  mod_provider, mod_model, rounds, enable_search, token_budget, on_close):
     """Generator: streams (status, tokens, chat, verdict) updates while the debate runs."""
     chat: list[dict] = []
 
     if not topic or not position:
         yield "### ⚠️ Topic and position are required.", "", chat, ""
         return
-    if not _run_lock.acquire(blocking=False):
-        yield "### ⚠️ A debate is already running.", "", chat, ""
-        return
 
+    budget = int(token_budget) if token_budget else None
+    meter = UsageMeter(hard_limit_tokens=budget)
+    events: queue.Queue = queue.Queue()
+    stop_event = threading.Event()
+    _active_stop["event"] = stop_event
+    record = {"topic": topic, "meter": meter, "status": "running",
+              "transcript": "", "detached": False}
+    _runs.append(record)
+
+    spec = DebateSpec(
+        topic=topic,
+        position=position,
+        prosecution_provider=pros_provider,
+        prosecution_model=pros_model.strip() or None,
+        defense_provider=def_provider,
+        defense_model=def_model.strip() or None,
+        moderator_provider=mod_provider,
+        moderator_model=mod_model.strip() or None,
+        max_rounds=int(rounds),
+        enable_search=bool(enable_search),
+        max_total_tokens=budget,
+        verbose=False,
+    )
+
+    def on_status(stage, agent):
+        events.put(("status", (stage, agent.name, agent.role.value, agent.provider.name)))
+
+    def on_turn(speaker, role, content):
+        events.put(("turn", (speaker, role, content)))
+
+    def worker():
+        try:
+            outcome = run_debate(
+                spec, meter=meter,
+                on_turn=on_turn, on_status=on_status,
+                should_stop=stop_event.is_set,
+            )
+            record["status"] = (
+                f"finished — {(outcome.result.winner or 'undecided').upper()} "
+                f"({outcome.result.termination_reason.value})"
+            )
+            record["transcript"] = str(outcome.transcript_path or "")
+            events.put(("done", outcome))
+        except Exception as e:
+            record["status"] = f"error: {str(e)[:120]}"
+            events.put(("error", str(e)))
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    status = "### 🏁 Starting debate…"
     try:
-        _stop_event.clear()
-        budget = int(token_budget) if token_budget else None
-        meter = UsageMeter(hard_limit_tokens=budget)
-        events: queue.Queue = queue.Queue()
-
-        spec = DebateSpec(
-            topic=topic,
-            position=position,
-            prosecution_provider=pros_provider,
-            prosecution_model=pros_model.strip() or None,
-            defense_provider=def_provider,
-            defense_model=def_model.strip() or None,
-            moderator_provider=mod_provider,
-            moderator_model=mod_model.strip() or None,
-            max_rounds=int(rounds),
-            enable_search=bool(enable_search),
-            max_total_tokens=budget,
-            verbose=False,
-        )
-
-        def on_status(stage, agent):
-            events.put(("status", (stage, agent.name, agent.role.value, agent.provider.name)))
-
-        def on_turn(speaker, role, content):
-            events.put(("turn", (speaker, role, content)))
-
-        def worker():
-            try:
-                outcome = run_debate(
-                    spec, meter=meter,
-                    on_turn=on_turn, on_status=on_status,
-                    should_stop=_stop_event.is_set,
-                )
-                events.put(("done", outcome))
-            except Exception as e:
-                events.put(("error", str(e)))
-
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
-
-        status = "### 🏁 Starting debate…"
         yield status, _fmt_tokens(meter, budget), chat, ""
 
         while True:
@@ -179,76 +332,141 @@ def run_debate_ui(topic, position, pros_provider, pros_model, def_provider, def_
                 )
                 yield "### ✅ Debate complete", _fmt_tokens(meter, budget), chat, verdict
                 return
+    except GeneratorExit:
+        # Browser disconnected mid-run: honor the on-close preference.
+        if record["status"] == "running":
+            if str(on_close).startswith("Abort"):
+                stop_event.set()
+                record["status"] = "aborting (tab closed)"
+            else:
+                record["detached"] = True
+        return
     finally:
-        _run_lock.release()
+        if _active_stop["event"] is stop_event:
+            _active_stop["event"] = None
+
+
+# ------------------------------------------------------------------- layout
+
+def _debate_tab():
+    with gr.Row():
+        with gr.Column(scale=1):
+            topic = gr.Textbox(label="Topic", value="Tabs vs Spaces")
+            position = gr.Textbox(
+                label="Prosecution position",
+                value="Tabs are superior to spaces",
+            )
+
+            role_inputs = {}
+            for role in ("prosecution", "defense", "moderator"):
+                with gr.Group():
+                    gr.Markdown(f"**{ROLE_EMOJI[role]} {role.capitalize()}**")
+                    with gr.Row():
+                        provider = gr.Dropdown(
+                            PROVIDERS, value="lmstudio", label="Provider", scale=1,
+                        )
+                        model = gr.Textbox(
+                            label="Model (blank = provider default)", scale=2,
+                        )
+                role_inputs[role] = (provider, model)
+
+            with gr.Accordion("🤖 APA model recommendations", open=False):
+                gr.Markdown(_recs_markdown())
+                rec_outputs = [w for pair in role_inputs.values() for w in pair]
+                with gr.Row():
+                    gr.Button("Apply APA winners", size="sm").click(
+                        lambda: _apply_recs(1), outputs=rec_outputs
+                    )
+                    gr.Button("Apply APA fallbacks", size="sm").click(
+                        lambda: _apply_recs(2), outputs=rec_outputs
+                    )
+
+            rounds = gr.Slider(1, 8, value=2, step=1, label="Max rounds")
+            enable_search = gr.Checkbox(label="Enable web search", value=False)
+            token_budget = gr.Number(
+                label="Hard token budget (total across all agents)",
+                value=200_000, precision=0,
+            )
+            on_close = gr.Radio(
+                ["Abort the debate", "Continue in background"],
+                value="Abort the debate",
+                label="If I close this tab mid-debate",
+            )
+
+            with gr.Row():
+                run_btn = gr.Button("▶️ Run debate", variant="primary")
+                stop_btn = gr.Button("⏹️ Stop")
+
+            background = gr.Markdown(background_md())
+            gr.Timer(5).tick(background_md, outputs=[background])
+
+        with gr.Column(scale=2):
+            status = gr.Markdown("### 💤 Idle")
+            tokens = gr.Markdown("")
+            chatbot = gr.Chatbot(label="Proceedings", height=520)
+            verdict = gr.Markdown("")
+
+    inputs = [topic, position]
+    for role in ("prosecution", "defense", "moderator"):
+        inputs.extend(role_inputs[role])
+    inputs.extend([rounds, enable_search, token_budget, on_close])
+
+    run_event = run_btn.click(
+        run_debate_ui,
+        inputs=inputs,
+        outputs=[status, tokens, chatbot, verdict],
+        js="(...args) => { window.__ec_running = true; return args; }",
+    )
+    run_event.then(None, js="() => { window.__ec_running = false; }")
+    stop_btn.click(stop_debate, outputs=[status])
+
+
+def _setup_tab():
+    gr.Markdown(
+        "### 🔑 Provider API keys\n"
+        "Paste a key, **Test** it, then **Save**. Keys go into a local `.env` file "
+        "readable only by your user account, and take effect immediately. "
+        "Only fill the providers you plan to use — LM Studio (local) needs no key.\n\n"
+        "Tip: create keys with a low monthly spend limit in each provider's console."
+    )
+    overview = gr.Markdown(key_overview_md())
+
+    boxes = {}
+    for provider in ("anthropic", "openai", "together", "gemini"):
+        with gr.Row():
+            box = gr.Textbox(
+                label=f"{provider} — {PROVIDER_ENV_KEYS[provider]}",
+                type="password", scale=3,
+            )
+            test_btn = gr.Button(f"Test", size="sm", scale=1)
+        result = gr.Markdown("")
+        test_btn.click(
+            lambda key, p=provider: test_provider_key(p, key),
+            inputs=[box], outputs=[result],
+        )
+        boxes[provider] = box
+
+    with gr.Row():
+        lms_btn = gr.Button("Test LM Studio (local, no key)", size="sm")
+        lms_result = gr.Markdown("")
+        lms_btn.click(lambda: test_provider_key("lmstudio", ""), outputs=[lms_result])
+
+    save_btn = gr.Button("💾 Save keys", variant="primary")
+    save_status = gr.Markdown("")
+    save_btn.click(
+        save_keys,
+        inputs=[boxes["anthropic"], boxes["openai"], boxes["together"], boxes["gemini"]],
+        outputs=[overview, save_status],
+    )
 
 
 def build_app() -> "gr.Blocks":
-    with gr.Blocks(title="EchoChamber") as app:
+    with gr.Blocks(title="EchoChamber", head=_HEAD_JS) as app:
         gr.Markdown("# ⚖️ EchoChamber — Multi-LLM Courtroom Debate")
-
-        with gr.Row():
-            with gr.Column(scale=1):
-                topic = gr.Textbox(label="Topic", value="Tabs vs Spaces")
-                position = gr.Textbox(
-                    label="Prosecution position",
-                    value="Tabs are superior to spaces",
-                )
-
-                role_inputs = {}
-                for role, default_provider in (
-                    ("prosecution", "lmstudio"),
-                    ("defense", "lmstudio"),
-                    ("moderator", "lmstudio"),
-                ):
-                    with gr.Group():
-                        gr.Markdown(f"**{ROLE_EMOJI[role]} {role.capitalize()}**")
-                        with gr.Row():
-                            provider = gr.Dropdown(
-                                PROVIDERS, value=default_provider,
-                                label="Provider", scale=1,
-                            )
-                            model = gr.Textbox(
-                                label="Model (blank = provider default)", scale=2,
-                            )
-                    role_inputs[role] = (provider, model)
-
-                with gr.Accordion("🤖 APA model recommendations", open=False):
-                    gr.Markdown(_recs_markdown())
-                    rec_outputs = [w for pair in role_inputs.values() for w in pair]
-                    with gr.Row():
-                        gr.Button("Apply APA winners", size="sm").click(
-                            lambda: _apply_recs(1), outputs=rec_outputs
-                        )
-                        gr.Button("Apply APA fallbacks", size="sm").click(
-                            lambda: _apply_recs(2), outputs=rec_outputs
-                        )
-
-                rounds = gr.Slider(1, 8, value=2, step=1, label="Max rounds")
-                enable_search = gr.Checkbox(label="Enable web search", value=False)
-                token_budget = gr.Number(
-                    label="Hard token budget (total across all agents)",
-                    value=200_000, precision=0,
-                )
-
-                with gr.Row():
-                    run_btn = gr.Button("▶️ Run debate", variant="primary")
-                    stop_btn = gr.Button("⏹️ Stop")
-
-            with gr.Column(scale=2):
-                status = gr.Markdown("### 💤 Idle")
-                tokens = gr.Markdown("")
-                chatbot = gr.Chatbot(label="Proceedings", height=520)
-                verdict = gr.Markdown("")
-
-        inputs = [topic, position]
-        for role in ("prosecution", "defense", "moderator"):
-            inputs.extend(role_inputs[role])
-        inputs.extend([rounds, enable_search, token_budget])
-
-        run_btn.click(run_debate_ui, inputs=inputs, outputs=[status, tokens, chatbot, verdict])
-        stop_btn.click(stop_debate, outputs=[status])
-
+        with gr.Tab("Debate"):
+            _debate_tab()
+        with gr.Tab("Setup"):
+            _setup_tab()
     return app
 
 
