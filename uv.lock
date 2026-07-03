@@ -882,6 +882,7 @@ ui = [
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
+    { name = "pyyaml" },
 ]
 
 [package.metadata]
@@ -908,7 +909,10 @@ requires-dist = [
 provides-extras = ["anthropic", "openai", "gemini", "search", "ui", "pdf", "rag", "batch", "env", "all", "dev"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=7.0.0" }]
+dev = [
+    { name = "pytest", specifier = ">=7.0.0" },
+    { name = "pyyaml", specifier = ">=6.0" },
+]
 
 [[package]]
 name = "exceptiongroup"

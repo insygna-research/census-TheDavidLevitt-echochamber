@@ -35,6 +35,7 @@ dev = [
 [dependency-groups]
 dev = [
     "pytest>=7.0.0",
+    "pyyaml>=6.0",  # batch config-loading tests
 ]
 
 [project.scripts]
