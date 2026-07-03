@@ -24,10 +24,15 @@ RETRYABLE_MARKERS = (
     "timeout",
     "timed out",
     "connection",
+    "disconnected",
+    "connection reset",
+    "broken pipe",
+    "remoteprotocol",
     "temporarily",
     "service unavailable",
     "internal server error",
     "apiconnection",
+    "resource exhausted",
 )
 
 
