@@ -1,0 +1,46 @@
+{
+  "_comment": "Sample APA export so recommendations work without an APA deployment. Real deployments point $ECHOCHAMBER_APA_DATA at their APA data directory (apa-roles.json + apa-state.json) or a merged export like this file. Shape: roles = per-use-case winner + ordered fallbacks; prices = scraped $/1M token table; cutoffs = minimum quality bar per role with rationale.",
+  "roles": {
+    "reasoning": {
+      "label": "Top reasoning",
+      "primary": "AA Intelligence",
+      "winner": "claude-opus-4-20250514",
+      "fallbacks": ["gemini-2.5-pro", "gpt-4o"]
+    },
+    "daily": {
+      "label": "Daily driver",
+      "primary": "AA Intelligence",
+      "winner": "claude-sonnet-4-20250514",
+      "fallbacks": ["gemini-2.5-flash", "gpt-4o-mini"]
+    },
+    "cheap": {
+      "label": "Cheapest adequate",
+      "primary": "AA Intelligence",
+      "winner": "gemini-2.5-flash",
+      "fallbacks": ["claude-haiku-3-5-20241022"]
+    }
+  },
+  "prices": {
+    "claude-opus-4": { "in": 15.0, "out": 75.0 },
+    "claude-sonnet-4": { "in": 3.0, "out": 15.0 },
+    "claude-haiku-3-5": { "in": 0.25, "out": 1.25 },
+    "gemini-2.5-pro": { "in": 1.25, "out": 10.0 },
+    "gemini-2.5-flash": { "in": 0.3, "out": 2.5 },
+    "gpt-4o": { "in": 2.5, "out": 10.0 },
+    "gpt-4o-mini": { "in": 0.15, "out": 0.6 }
+  },
+  "cutoffs": {
+    "reasoning": {
+      "min": 50,
+      "why": "Judging a debate is hard analysis: weighing argument quality, spotting logical gaps, and resisting rhetorical flourish takes frontier-tier reasoning."
+    },
+    "daily": {
+      "min": 33,
+      "why": "Advocacy needs solid comprehension and structured argumentation, not frontier depth; mid-tier models argue coherently without overpaying per turn."
+    },
+    "cheap": {
+      "min": 20,
+      "why": "Adequate for mechanical tasks; below this bar argument quality degrades noticeably."
+    }
+  }
+}

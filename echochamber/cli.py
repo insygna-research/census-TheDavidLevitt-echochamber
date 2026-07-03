@@ -148,6 +148,13 @@ Examples:
         help="Allow agents to be convinced by opposing arguments (default: strict adversarial)",
     )
     parser.add_argument(
+        "--max-total-tokens",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Hard token budget across all agents; the session halts gracefully when crossed (default: unlimited)",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress verbose output during debate",
@@ -243,6 +250,7 @@ def main():
         enable_search=enable_search,
         max_searches_per_turn=args.max_searches_per_turn,
         moderator_searches_per_turn=args.moderator_searches_per_turn,
+        max_total_tokens=args.max_total_tokens,
         verbose=not args.quiet,
         transcript_dir=args.transcript_dir,
         save_transcript_json=args.save_transcript,

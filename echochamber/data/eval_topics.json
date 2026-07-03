@@ -1,0 +1,13 @@
+{
+  "_comment": "Default debate topics for the model eval harness. Deliberately two-sided: a topic a fixed judge can score on argument quality rather than ground truth.",
+  "topics": [
+    { "topic": "Remote-first vs office-first engineering teams", "position": "Engineering teams should be remote-first" },
+    { "topic": "Monorepo vs polyrepo for a 50-engineer company", "position": "A monorepo is the better choice" },
+    { "topic": "Should startups build on serverless infrastructure?", "position": "Startups should default to serverless" },
+    { "topic": "Static vs dynamic typing for large codebases", "position": "Large codebases should use static typing" },
+    { "topic": "Should AI coding assistants be allowed in technical interviews?", "position": "AI assistants should be allowed in technical interviews" },
+    { "topic": "Universal basic income as automation insurance", "position": "UBI is the right response to AI-driven job displacement" },
+    { "topic": "Nuclear power in the 2030 energy mix", "position": "Nuclear should be the backbone of the 2030 energy mix" },
+    { "topic": "Should social media require identity verification?", "position": "Social platforms should verify real identities" }
+  ]
+}

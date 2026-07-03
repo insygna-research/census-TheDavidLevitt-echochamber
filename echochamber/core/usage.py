@@ -17,6 +17,15 @@ from typing import Optional
 from .costs import get_model_pricing
 
 
+class TokenBudgetExceeded(RuntimeError):
+    """Raised by UsageMeter.record when a hard token limit is crossed."""
+
+    def __init__(self, spent: int, limit: int):
+        self.spent = spent
+        self.limit = limit
+        super().__init__(f"token budget exceeded: {spent:,} of {limit:,} tokens spent")
+
+
 @dataclass
 class UsageEvent:
     """One metered provider call."""
@@ -47,8 +56,14 @@ class UsageEvent:
 
 @dataclass
 class UsageMeter:
-    """Accumulates usage events across a debate run. Thread-safe."""
+    """Accumulates usage events across a debate run. Thread-safe.
+
+    If hard_limit_tokens is set, record() raises TokenBudgetExceeded once
+    total tokens (input + output) cross it. The call that crossed the limit
+    is still recorded, so reports stay accurate.
+    """
     host: str = "echochamber"
+    hard_limit_tokens: Optional[int] = None
     events: list = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -80,9 +95,20 @@ class UsageMeter:
         )
         with self._lock:
             self.events.append(event)
+            spent = sum(e.input_tokens + e.output_tokens for e in self.events)
+        if self.hard_limit_tokens and spent > self.hard_limit_tokens:
+            raise TokenBudgetExceeded(spent, self.hard_limit_tokens)
 
     def total_cost(self) -> float:
         return sum(e.cost_usd for e in self.events)
+
+    def total_tokens(self) -> tuple[int, int]:
+        """(input_tokens, output_tokens) across all events."""
+        with self._lock:
+            return (
+                sum(e.input_tokens for e in self.events),
+                sum(e.output_tokens for e in self.events),
+            )
 
     def summary(self) -> str:
         """Human-readable per-module cost/token summary."""

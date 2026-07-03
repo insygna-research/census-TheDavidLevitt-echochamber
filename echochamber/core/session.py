@@ -10,6 +10,7 @@ from .transcript import Transcript
 from .evidence import EvidenceStore
 from .preprocessor import ProcessedEvidenceStore, ContextStrategy
 from .turns import run_agent_turn
+from .usage import TokenBudgetExceeded
 from ..providers import Message, ToolDef
 
 
@@ -18,7 +19,13 @@ class TerminationReason(Enum):
     MAX_ROUNDS = "max_rounds"
     CONCESSION = "concession"
     MODERATOR_DECISION = "moderator_decision"
+    TOKEN_BUDGET = "token_budget"
+    CANCELLED = "cancelled"
     ERROR = "error"
+
+
+class SessionCancelled(RuntimeError):
+    """Raised internally when should_stop() requests an abort."""
 
 
 @dataclass
@@ -107,6 +114,8 @@ class CourtSession:
         config: Optional[SessionConfig] = None,
         evidence: Optional[Union[EvidenceStore, ProcessedEvidenceStore]] = None,
         on_turn: Optional[Callable[[str, str, str], None]] = None,
+        on_status: Optional[Callable[[str, "Agent"], None]] = None,
+        should_stop: Optional[Callable[[], bool]] = None,
         search_tool: Optional[object] = None,
         max_searches_per_turn: int = 0,
         max_moderator_searches: int = 0,
@@ -121,6 +130,11 @@ class CourtSession:
             config: Session configuration
             evidence: Optional evidence store (raw or processed) with case documents
             on_turn: Callback(speaker, role, content) after each turn
+            on_status: Callback(stage, agent) fired as each phase starts —
+                stages: "opening", "round N: prosecution/defense",
+                "round N: evaluation", "final ruling"
+            should_stop: Polled before each phase; returning True aborts the
+                session gracefully (termination reason "cancelled")
             search_tool: Optional WebSearchTool available to agents during turns
             max_searches_per_turn: Search budget per advocate turn (0 = disabled)
             max_moderator_searches: Search budget for the moderator (0 = disabled)
@@ -138,6 +152,8 @@ class CourtSession:
         self.config = config or SessionConfig()
         self.evidence = evidence
         self.on_turn = on_turn
+        self.on_status = on_status
+        self.should_stop = should_stop
         self.search_tool = search_tool
         self.max_searches_per_turn = max_searches_per_turn
         self.max_moderator_searches = max_moderator_searches
@@ -198,20 +214,22 @@ The debate ends when:
             self._log(self.evidence.summary())
         self._log("-" * 50)
 
-        # Moderator opens the session
-        opening = self._get_moderator_opening(case_context)
-        self._record_turn(self.moderator.name, "moderator", opening)
-
         round_num = 0
         termination_reason = TerminationReason.MAX_ROUNDS
         winner = None
 
         try:
+            # Moderator opens the session
+            self._phase("opening", self.moderator)
+            opening = self._get_moderator_opening(case_context)
+            self._record_turn(self.moderator.name, "moderator", opening)
+
             for round_num in range(1, self.config.max_rounds + 1):
                 self.transcript.total_rounds = round_num
                 self._log(f"\n=== ROUND {round_num} ===\n")
 
                 # Prosecution argues
+                self._phase(f"round {round_num}: prosecution", self.prosecution)
                 prosecution_response = self._get_advocate_argument(
                     self.prosecution, case_context, round_num
                 )
@@ -226,6 +244,7 @@ The debate ends when:
                     break
 
                 # Defense responds
+                self._phase(f"round {round_num}: defense", self.defense)
                 defense_response = self._get_advocate_argument(
                     self.defense, case_context, round_num
                 )
@@ -241,6 +260,7 @@ The debate ends when:
 
                 # Moderator evaluates
                 if self.config.require_moderator_approval:
+                    self._phase(f"round {round_num}: evaluation", self.moderator)
                     should_continue, mod_winner, reasoning = self._get_moderator_evaluation(
                         case_context, round_num
                     )
@@ -253,6 +273,12 @@ The debate ends when:
                         winner = mod_winner
                         break
 
+        except TokenBudgetExceeded as e:
+            self._log(f"Token budget reached: {e}")
+            termination_reason = TerminationReason.TOKEN_BUDGET
+        except SessionCancelled:
+            self._log("Session cancelled by user.")
+            termination_reason = TerminationReason.CANCELLED
         except Exception as e:
             self._log(f"Error during session: {e}")
             termination_reason = TerminationReason.ERROR
@@ -262,8 +288,24 @@ The debate ends when:
                 content=f"Session terminated due to error: {e}",
             )
 
-        # Get final ruling (may update winner if not already set)
-        final_ruling, final_winner = self._get_final_ruling(case_context, termination_reason, winner)
+        # Get final ruling (may update winner if not already set). Skipped for
+        # budget/cancel stops — the whole point is to stop spending tokens.
+        if termination_reason in (TerminationReason.TOKEN_BUDGET, TerminationReason.CANCELLED):
+            final_ruling = (
+                f"Session halted ({termination_reason.value}) before a final ruling could be made."
+            )
+            final_winner = winner
+        else:
+            self._phase("final ruling", self.moderator)
+            try:
+                final_ruling, final_winner = self._get_final_ruling(
+                    case_context, termination_reason, winner
+                )
+            except TokenBudgetExceeded as e:
+                self._log(f"Token budget reached during final ruling: {e}")
+                termination_reason = TerminationReason.TOKEN_BUDGET
+                final_ruling = "Session halted (token_budget) during the final ruling."
+                final_winner = winner
         self._record_turn(self.moderator.name, "moderator", final_ruling)
 
         # Use updated winner from final ruling if available
@@ -445,6 +487,8 @@ End the debate (continue_debate = false) only if:
             response = self.moderator.respond_full(
                 messages, tools=[EVALUATION_TOOL], tool_choice="submit_evaluation"
             )
+        except TokenBudgetExceeded:
+            raise  # a budget stop must not trigger the (token-spending) fallback
         except Exception as e:
             self._log(f"  [structured evaluation failed ({e}); using text protocol]")
             return None
@@ -601,6 +645,8 @@ When ready, submit your complete final ruling with the submit_verdict tool.
                     else:
                         result = "Search budget exhausted. Submit your verdict now."
                     convo.append(Message(role="tool", content=result, tool_call_id=tc.id))
+        except TokenBudgetExceeded:
+            raise  # a budget stop must not trigger the (token-spending) fallback
         except Exception as e:
             self._log(f"  [structured ruling failed ({e}); using text protocol]")
             return None
@@ -666,6 +712,13 @@ Give your complete final ruling:
         ]
         final_ruling = self.moderator.respond(messages_with_search)
         return final_ruling
+
+    def _phase(self, stage: str, agent: Agent) -> None:
+        """Announce a phase start and honor cancellation requests."""
+        if self.should_stop and self.should_stop():
+            raise SessionCancelled()
+        if self.on_status:
+            self.on_status(stage, agent)
 
     def _check_concession(self, response: str) -> bool:
         """Check if the response contains a concession."""

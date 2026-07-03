@@ -15,6 +15,7 @@ from typing import Callable, Optional
 
 from ..providers import Message
 from .agent import Agent
+from .usage import TokenBudgetExceeded
 
 # Iterations beyond the search budget, to give the agent a closing call
 # after its last results arrive.
@@ -46,6 +47,8 @@ def run_agent_turn(
     if search_enabled and agent.provider.supports_tools:
         try:
             return _native_turn(agent, messages, search_tool, max_searches, log)
+        except TokenBudgetExceeded:
+            raise  # a budget stop must not trigger the (token-spending) fallback
         except Exception as e:
             # Some endpoints (notably local models via LM Studio) reject
             # tool-enabled requests; degrade to the sentinel transport.

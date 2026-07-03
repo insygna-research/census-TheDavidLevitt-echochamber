@@ -19,7 +19,10 @@ Moderator searches, then rules → submit_verdict(winner, reasoning)
 - **Native tool calling with graceful degradation** — agents on tool-capable providers get a real `web_search` tool and the moderator returns structured verdicts through `submit_evaluation`/`submit_verdict` tools; providers without tool support (or local models that reject tools) automatically fall back to a `[SEARCH: query]` / `FINAL VERDICT:` text protocol.
 - **Evidence folders** — drop `.txt/.md/.json/.csv/.pdf` files into a case folder with `shared/`, `prosecution/`, `defense/`, and `moderator/` subfolders; each agent only sees what its role is entitled to.
 - **Context strategies** — evidence is injected whole (`full`), condensed (`summarize`), or retrieved on demand via ChromaDB embeddings (`rag`), auto-selected by size.
-- **Cost metering** — every provider call is recorded (tokens, latency, cost from a data-driven pricing table); runs print a per-role cost summary and can export JSONL usage events.
+- **Cost metering and hard budgets** — every provider call is recorded (tokens, latency, cost from a data-driven pricing table); runs print a per-role cost summary, can export JSONL usage events, and `--max-total-tokens` halts a runaway debate gracefully mid-session.
+- **Live GUI** — a Gradio app showing which agent/model is currently speaking, tokens burned against the budget, streaming turns, and the verdict.
+- **Model recommendations (APA)** — surfaces top-2 model picks per role (with justification, price, and quality bar) from an APA procurement export, falling back to a bundled sample.
+- **Debates as model evals** — a harness that scores a candidate model against an incumbent via side-balanced debates under a fixed judge, emitting a win-rate report and an APA-shaped finding.
 - **Batch runner** — run a matrix of provider/model combinations on a thread pool from a YAML config, with cost estimates up front and actual costs in the report.
 - **Transcripts** — every session is saved as markdown and optionally JSON. See [examples/](examples/) for sample outputs, including the all-important *pineapple on pizza* proceedings.
 
@@ -65,6 +68,40 @@ Each role gets its own private evidence plus everything in `shared/`. A `moderat
 
 > **Note:** `cases/` is gitignored except for the bundled example — real case material stays out of version control by default.
 
+### GUI
+
+```bash
+uv sync --extra ui
+uv run python -m echochamber.ui     # http://localhost:7860
+```
+
+Configure providers/models per role (or one-click apply the APA picks), set a hard token budget, and watch the debate stream: a status banner shows which agent and model is speaking, a live ticker shows tokens burned against budget and running cost, and the verdict lands with a per-role cost breakdown. A Stop button aborts after the current turn.
+
+### Model evals — debates as benchmarks
+
+A debate win under a fixed judge is a capability signal. The eval harness pits a candidate model against an incumbent across N topics, each debated twice with sides swapped (so side bias cancels), same judge throughout:
+
+```bash
+uv run python -m echochamber.evals \
+  --candidate-provider gemini --candidate gemini-2.5-pro \
+  --incumbent-provider gemini --incumbent gemini-2.0-flash \
+  --judge-provider gemini --judge gemini-2.5-pro \
+  --topics 3 --rounds 1 --max-total-tokens 30000 \
+  --apa-findings findings.jsonl
+```
+
+Outputs a JSON report (win/loss/draw per matchup, score, actual cost) and optionally appends an APA-shaped finding (`{kind, lab, model, headline, why, priceIn, priceOut}`) that a procurement agent can ingest — closing the loop: APA recommends models for debates, and debates feed evidence back to APA. Evals are noisy at small N; use 3+ topics and expect ~0.5 for equal models.
+
+### APA model recommendations
+
+If you run an APA (Agent Procurement Agent) deployment, point EchoChamber at it:
+
+```bash
+export ECHOCHAMBER_APA_DATA=~/path/to/apa/data   # dir with apa-roles.json + apa-state.json, or a merged export
+```
+
+The GUI (and `echochamber.recommendations`) then surfaces the top-2 models per debate role — judge maps to APA's "reasoning" role, advocates to "daily" — each with justification, current price, and the benchmark bar it cleared. Without APA data, a bundled sample keeps the feature demonstrable.
+
 ### Batch runs
 
 ```bash
@@ -89,13 +126,16 @@ The event shape follows agent-stable's normalized usage-event schema (a companio
 ```
 echochamber/
 ├── cli.py                  # Thin argparse layer over the runner
+├── ui.py                   # Gradio GUI: live status, token/cost ticker, stop button
+├── evals.py                # Debates-as-benchmarks harness → report + APA finding
+├── recommendations.py      # APA export → top-2 model picks per debate role
 ├── batch.py                # Thread-pool multi-run orchestration + cost gates
 ├── core/
 │   ├── runner.py           # DebateSpec + run_debate(): the one entry point
 │   ├── session.py          # CourtSession: round loop, structured verdicts + text fallback
 │   ├── turns.py            # Agent turn loop: native tool transport or sentinel fallback
 │   ├── agent.py            # Agent = name + role + provider + prompt (+ meter)
-│   ├── usage.py            # UsageMeter → cost summaries + agent-stable JSONL events
+│   ├── usage.py            # UsageMeter → cost summaries, JSONL events, hard token budget
 │   ├── evidence.py         # Case folder loading (txt/md/json/csv/pdf)
 │   ├── preprocessor.py     # full / summarize / RAG context strategies
 │   ├── transcript.py       # Markdown + JSON transcript writing

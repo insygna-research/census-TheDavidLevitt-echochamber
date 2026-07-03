@@ -75,6 +75,7 @@ class DebateSpec:
     enable_search: bool = True
     max_searches_per_turn: int = 2
     moderator_searches_per_turn: int = 5
+    max_total_tokens: Optional[int] = None  # hard stop across all agents (None = unlimited)
     verbose: bool = True
     transcript_dir: str = "./transcripts"
     save_transcript_json: Optional[str] = None
@@ -221,6 +222,10 @@ def build_agent(
 def run_debate(
     spec: DebateSpec,
     provider_factory: Callable = create_provider,
+    meter: Optional[UsageMeter] = None,
+    on_turn: Optional[Callable] = None,
+    on_status: Optional[Callable] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> DebateOutcome:
     """
     Run one debate end to end: evidence, agents, session, transcripts.
@@ -228,12 +233,18 @@ def run_debate(
     Args:
         spec: The debate configuration
         provider_factory: create_provider-compatible factory (injectable for tests)
+        meter: Optional pre-built UsageMeter (e.g. for live UI polling);
+            created from spec.max_total_tokens if omitted
+        on_turn: Callback(speaker, role, content) after each recorded turn
+        on_status: Callback(stage, agent) as each phase starts
+        should_stop: Polled between phases; True aborts gracefully
 
     Returns:
         DebateOutcome with the session result, usage meter, and artifacts
     """
     log = print if spec.verbose else (lambda s: None)
-    meter = UsageMeter()
+    if meter is None:
+        meter = UsageMeter(hard_limit_tokens=spec.max_total_tokens)
 
     # Load evidence if case folder specified
     evidence = None
@@ -337,6 +348,9 @@ def run_debate(
         moderator=moderator,
         config=config,
         evidence=evidence,
+        on_turn=on_turn,
+        on_status=on_status,
+        should_stop=should_stop,
         search_tool=search_tool,
         max_searches_per_turn=spec.max_searches_per_turn if spec.enable_search else 0,
         max_moderator_searches=spec.moderator_searches_per_turn if spec.enable_search else 0,
