@@ -79,6 +79,8 @@ uv run python -m echochamber.ui     # http://localhost:7860
 
 Configure providers/models per role (or one-click apply the APA picks), set a hard token budget, and watch the debate stream: a status banner shows which agent and model is speaking, a live ticker shows tokens burned against budget and running cost, and the verdict lands with a per-role cost breakdown. A Stop button aborts after the current turn.
 
+Each role also takes **custom system-prompt additions**, and the **Case evidence** panel links a local case folder (`shared/` for everyone plus proprietary `prosecution/`, `defense/`, `moderator/` subfolders) with an inspect button showing exactly what each side will see.
+
 No terminal needed for keys: the **Setup tab** lets you paste provider API keys, test each one against the live API, and save — keys land in a local `.env` readable only by your user account and take effect immediately. (Tip: create keys with low spend limits in each provider's console.)
 
 Closing the tab mid-debate triggers the browser's leave warning; an on-page preference decides whether the debate then **aborts or continues in the background** (backgrounded runs stay listed with live token counts and still save transcripts).

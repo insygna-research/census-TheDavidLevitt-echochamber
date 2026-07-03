@@ -67,6 +67,11 @@ class DebateSpec:
     max_rounds: int = 3
     allow_concession: bool = False
     allow_conviction: bool = False
+    # Per-role custom instructions, appended to the role's system prompt
+    # (combined with any instruction files found in the case folder).
+    prosecution_instructions: str = ""
+    defense_instructions: str = ""
+    moderator_instructions: str = ""
     case_folder: Optional[str] = None
     context_strategy: str = "auto"  # auto | full | summarize | rag
     max_context_tokens: int = 100_000
@@ -268,11 +273,18 @@ def run_debate(
         from ..tools import WebSearchTool
         search_tool = WebSearchTool(max_results=5)
 
-    # Get instructions from evidence files (if any)
-    role_instructions = {role: "" for role in (Role.PROSECUTION, Role.DEFENSE, Role.MODERATOR)}
-    if raw_evidence:
-        for role in role_instructions:
-            role_instructions[role] = raw_evidence.get_instructions_for_role(role)
+    # Combine instructions from evidence files (if any) with spec overrides
+    spec_instructions = {
+        Role.PROSECUTION: spec.prosecution_instructions,
+        Role.DEFENSE: spec.defense_instructions,
+        Role.MODERATOR: spec.moderator_instructions,
+    }
+    role_instructions = {}
+    for role, custom in spec_instructions.items():
+        from_evidence = raw_evidence.get_instructions_for_role(role) if raw_evidence else ""
+        role_instructions[role] = "\n\n".join(
+            part.strip() for part in (from_evidence, custom) if part and part.strip()
+        )
 
     # Resolve model names (auto-detect for lmstudio, role-specific defaults)
     prosecution_model = resolve_model(spec.prosecution_provider, spec.prosecution_model, "advocate")

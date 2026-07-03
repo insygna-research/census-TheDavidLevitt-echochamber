@@ -176,6 +176,12 @@ Examples:
             default=None,
             help=f"Model for {role} (defaults to the provider's role default; auto-detected for lmstudio)",
         )
+        parser.add_argument(
+            f"--{role}-instructions",
+            default="",
+            metavar="TEXT",
+            help=f"Custom instructions appended to the {role} system prompt",
+        )
 
     # Output
     parser.add_argument(
@@ -235,10 +241,13 @@ def main():
         position=args.position,
         prosecution_provider=args.prosecution_provider,
         prosecution_model=args.prosecution_model,
+        prosecution_instructions=args.prosecution_instructions,
         defense_provider=args.defense_provider,
         defense_model=args.defense_model,
+        defense_instructions=args.defense_instructions,
         moderator_provider=args.moderator_provider,
         moderator_model=args.moderator_model,
+        moderator_instructions=args.moderator_instructions,
         max_rounds=args.max_rounds,
         allow_concession=args.allow_concession,
         allow_conviction=args.allow_conviction,

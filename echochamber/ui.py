@@ -238,8 +238,24 @@ def background_md() -> str:
     return "\n".join(lines)
 
 
-def run_debate_ui(topic, position, pros_provider, pros_model, def_provider, def_model,
-                  mod_provider, mod_model, rounds, enable_search, token_budget, on_close):
+def inspect_evidence(path: str) -> str:
+    """Preview what a case folder would load for each role."""
+    path = (path or "").strip()
+    if not path:
+        return "_No case folder set — the debate runs on the topic alone._"
+    try:
+        from .core.evidence import EvidenceStore
+        store = EvidenceStore.load(path)
+        return f"```\n{store.summary()}\n```"
+    except Exception as e:
+        return f"❌ Could not load `{path}`: {e}"
+
+
+def run_debate_ui(topic, position, pros_provider, pros_model, pros_instr,
+                  def_provider, def_model, def_instr,
+                  mod_provider, mod_model, mod_instr,
+                  case_folder, context_strategy,
+                  rounds, enable_search, token_budget, on_close):
     """Generator: streams (status, tokens, chat, verdict) updates while the debate runs."""
     chat: list[dict] = []
 
@@ -261,10 +277,15 @@ def run_debate_ui(topic, position, pros_provider, pros_model, def_provider, def_
         position=position,
         prosecution_provider=pros_provider,
         prosecution_model=pros_model.strip() or None,
+        prosecution_instructions=pros_instr.strip(),
         defense_provider=def_provider,
         defense_model=def_model.strip() or None,
+        defense_instructions=def_instr.strip(),
         moderator_provider=mod_provider,
         moderator_model=mod_model.strip() or None,
+        moderator_instructions=mod_instr.strip(),
+        case_folder=case_folder.strip() or None,
+        context_strategy=context_strategy,
         max_rounds=int(rounds),
         enable_search=bool(enable_search),
         max_total_tokens=budget,
@@ -364,6 +385,25 @@ def _debate_tab():
                 value="Tabs are superior to spaces",
             )
 
+            with gr.Accordion("📁 Case evidence (optional)", open=False):
+                gr.Markdown(
+                    "Link a local case folder with `shared/` (visible to all sides) "
+                    "plus proprietary `prosecution/`, `defense/`, and `moderator/` "
+                    "subfolders (`.txt/.md/.json/.csv/.pdf`). Scaffold one with "
+                    "`echochamber --init-case ./cases/my_case`."
+                )
+                case_folder = gr.Textbox(
+                    label="Case folder path", placeholder="cases/example_case",
+                )
+                with gr.Row():
+                    context_strategy = gr.Dropdown(
+                        ["auto", "full", "summarize", "rag"], value="auto",
+                        label="Context strategy", scale=1,
+                    )
+                    inspect_btn = gr.Button("🔍 Inspect evidence", size="sm", scale=1)
+                evidence_info = gr.Markdown("")
+                inspect_btn.click(inspect_evidence, inputs=[case_folder], outputs=[evidence_info])
+
             role_inputs = {}
             for role in ("prosecution", "defense", "moderator"):
                 with gr.Group():
@@ -375,11 +415,17 @@ def _debate_tab():
                         model = gr.Textbox(
                             label="Model (blank = provider default)", scale=2,
                         )
-                role_inputs[role] = (provider, model)
+                    instructions = gr.Textbox(
+                        label="Custom system prompt additions (optional)",
+                        placeholder="Appended to this agent's system prompt",
+                        lines=2,
+                    )
+                role_inputs[role] = (provider, model, instructions)
 
             with gr.Accordion("🤖 APA model recommendations", open=False):
                 gr.Markdown(_recs_markdown())
-                rec_outputs = [w for pair in role_inputs.values() for w in pair]
+                # Apply buttons set provider + model only (not instructions)
+                rec_outputs = [w for triple in role_inputs.values() for w in triple[:2]]
                 with gr.Row():
                     gr.Button("Apply APA winners", size="sm").click(
                         lambda: _apply_recs(1), outputs=rec_outputs
@@ -416,7 +462,7 @@ def _debate_tab():
     inputs = [topic, position]
     for role in ("prosecution", "defense", "moderator"):
         inputs.extend(role_inputs[role])
-    inputs.extend([rounds, enable_search, token_budget, on_close])
+    inputs.extend([case_folder, context_strategy, rounds, enable_search, token_budget, on_close])
 
     run_event = run_btn.click(
         run_debate_ui,
