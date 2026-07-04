@@ -2,7 +2,11 @@
 
 ![EchoChamber GUI running a live debate](docs/demo.gif)
 
-📹 Full videos: [a complete debate, live](docs/demo-debate.mp4) · [setup & configuration walkthrough](docs/demo-setup.mp4)
+### 📹 Full debate, live
+https://github.com/user-attachments/assets/79130956-d2f3-47c2-b596-e12a99ce815d
+
+### 📹 Setup & configuration walkthrough
+https://github.com/user-attachments/assets/dc0125e9-2728-4452-8c8e-f8a5f76daa0c
 
 **A multi-LLM courtroom debate environment.** Give it a topic and a position, and three LLM agents — Prosecution, Defense, and a Moderator/Judge — argue it out over structured rounds until a verdict is reached. Each agent can run on a different provider, so you can pit Claude against Llama with DeepSeek on the bench.
 
