@@ -6,7 +6,7 @@ protocol; the concrete providers only differ in how the client is built.
 
 import json
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 from .base import LLMProvider, LLMResponse, Message, ToolCall, ToolDef
 from .retry import call_with_retries
@@ -65,6 +65,7 @@ class OpenAICompatProvider(LLMProvider):
         max_tokens: int = 1024,
         tools: Optional[list[ToolDef]] = None,
         tool_choice: Optional[str] = None,
+        on_delta: Optional[Callable[[str], None]] = None,
     ) -> LLMResponse:
         kwargs = {
             "model": self.model,
@@ -72,6 +73,14 @@ class OpenAICompatProvider(LLMProvider):
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+
+        # Stream text-only calls; tool calls arrive as deltas that would need
+        # reassembly, so those requests stay non-streaming.
+        if on_delta and not tools:
+            try:
+                return self._complete_streaming(kwargs, on_delta)
+            except Exception:
+                pass  # endpoint may not support streaming — fall through
         if tools:
             kwargs["tools"] = [
                 {
@@ -117,4 +126,39 @@ class OpenAICompatProvider(LLMProvider):
             raw_response=response.model_dump() if hasattr(response, "model_dump") else None,
             tool_calls=tool_calls,
             latency_ms=latency_ms,
+        )
+
+    def _complete_streaming(self, kwargs: dict, on_delta) -> LLMResponse:
+        """Stream a text-only completion, emitting fragments via on_delta."""
+        stream_kwargs = {
+            **kwargs,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        start = time.time()
+        stream = call_with_retries(
+            lambda: self.client.chat.completions.create(**stream_kwargs)
+        )
+        parts: list[str] = []
+        usage = None
+        model = self.model
+        for chunk in stream:
+            if getattr(chunk, "model", None):
+                model = chunk.model
+            if chunk.usage:
+                usage = {
+                    "input_tokens": chunk.usage.prompt_tokens,
+                    "output_tokens": chunk.usage.completion_tokens,
+                }
+            if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                fragment = chunk.choices[0].delta.content
+                parts.append(fragment)
+                on_delta(fragment)
+
+        return LLMResponse(
+            content="".join(parts),
+            model=model,
+            usage=usage,
+            raw_response=None,
+            latency_ms=(time.time() - start) * 1000,
         )

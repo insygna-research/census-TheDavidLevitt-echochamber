@@ -28,6 +28,7 @@ def run_agent_turn(
     search_tool: Optional[object] = None,
     max_searches: int = 0,
     log: Callable[[str], None] = lambda s: None,
+    on_delta: Optional[Callable[[str], None]] = None,
 ) -> str:
     """
     Run one agent turn, executing any web searches the agent requests.
@@ -38,6 +39,8 @@ def run_agent_turn(
         search_tool: WebSearchTool, or None to disable search
         max_searches: Search budget for this turn (0 = disabled)
         log: Progress logger
+        on_delta: Streams text fragments as they generate (text-only calls;
+            tool-using calls arrive whole)
 
     Returns:
         The agent's final text for the turn
@@ -54,7 +57,7 @@ def run_agent_turn(
             # tool-enabled requests; degrade to the sentinel transport.
             log(f"  [{agent.name}: native tools failed ({e}); falling back to text protocol]")
 
-    text = agent.respond(messages)
+    text = agent.respond_full(messages, on_delta=on_delta).content
     if not search_enabled:
         return text
     return _sentinel_followup(agent, messages, text, search_tool, max_searches, log)

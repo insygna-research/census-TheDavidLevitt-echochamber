@@ -115,6 +115,7 @@ class CourtSession:
         evidence: Optional[Union[EvidenceStore, ProcessedEvidenceStore]] = None,
         on_turn: Optional[Callable[[str, str, str], None]] = None,
         on_status: Optional[Callable[[str, "Agent"], None]] = None,
+        on_delta: Optional[Callable[[str, str, str], None]] = None,
         should_stop: Optional[Callable[[], bool]] = None,
         search_tool: Optional[object] = None,
         max_searches_per_turn: int = 0,
@@ -133,6 +134,8 @@ class CourtSession:
             on_status: Callback(stage, agent) fired as each phase starts —
                 stages: "opening", "round N: prosecution/defense",
                 "round N: evaluation", "final ruling"
+            on_delta: Callback(speaker, role, fragment) streaming text as it
+                generates (text-only turns; tool-using turns arrive whole)
             should_stop: Polled before each phase; returning True aborts the
                 session gracefully (termination reason "cancelled")
             search_tool: Optional WebSearchTool available to agents during turns
@@ -153,6 +156,7 @@ class CourtSession:
         self.evidence = evidence
         self.on_turn = on_turn
         self.on_status = on_status
+        self.on_delta = on_delta
         self.should_stop = should_stop
         self.search_tool = search_tool
         self.max_searches_per_turn = max_searches_per_turn
@@ -356,6 +360,12 @@ The debate ends when:
             return f"{base_context}\n{role_evidence}"
         return base_context
 
+    def _delta_for(self, agent: Agent) -> Optional[Callable[[str], None]]:
+        """Bind the on_delta callback to a specific speaker."""
+        if not self.on_delta:
+            return None
+        return lambda fragment: self.on_delta(agent.name, agent.role.value, fragment)
+
     def _get_moderator_opening(self, case_context: str) -> str:
         """Get the moderator's opening statement."""
         context = self._get_evidence_context_for_role(Role.MODERATOR, case_context)
@@ -365,7 +375,9 @@ The debate ends when:
                 content=f"{context}\n\nPlease open this court session with a brief statement about the case and rules.",
             )
         ]
-        return self.moderator.respond(messages)
+        return self.moderator.respond_full(
+            messages, on_delta=self._delta_for(self.moderator)
+        ).content
 
     def _get_advocate_argument(self, agent: Agent, case_context: str, round_num: int) -> str:
         """Get an advocate's argument for this round, searches included."""
@@ -413,6 +425,7 @@ This is round {round_num}. {action}
             search_tool=self.search_tool,
             max_searches=self.max_searches_per_turn,
             log=self._log,
+            on_delta=self._delta_for(agent),
         )
 
     def _get_moderator_evaluation(

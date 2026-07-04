@@ -235,6 +235,7 @@ def run_debate(
     meter: Optional[UsageMeter] = None,
     on_turn: Optional[Callable] = None,
     on_status: Optional[Callable] = None,
+    on_delta: Optional[Callable] = None,
     should_stop: Optional[Callable[[], bool]] = None,
 ) -> DebateOutcome:
     """
@@ -247,6 +248,7 @@ def run_debate(
             created from spec.max_total_tokens if omitted
         on_turn: Callback(speaker, role, content) after each recorded turn
         on_status: Callback(stage, agent) as each phase starts
+        on_delta: Callback(speaker, role, fragment) streaming turn text live
         should_stop: Polled between phases; True aborts gracefully
 
     Returns:
@@ -370,6 +372,7 @@ def run_debate(
         evidence=evidence,
         on_turn=on_turn,
         on_status=on_status,
+        on_delta=on_delta,
         should_stop=should_stop,
         search_tool=search_tool,
         max_searches_per_turn=spec.max_searches_per_turn if spec.enable_search else 0,

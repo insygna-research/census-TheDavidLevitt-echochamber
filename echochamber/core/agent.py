@@ -43,6 +43,7 @@ class Agent:
         additional_context: Optional[str] = None,
         tools: Optional[list[ToolDef]] = None,
         tool_choice: Optional[str] = None,
+        on_delta=None,
     ) -> LLMResponse:
         """
         Generate a response, returning the full LLMResponse (tool calls, usage).
@@ -68,6 +69,7 @@ class Agent:
             max_tokens=self.max_tokens,
             tools=tools,
             tool_choice=tool_choice,
+            on_delta=on_delta,
         )
 
         if self.meter:

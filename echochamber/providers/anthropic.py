@@ -2,7 +2,7 @@
 
 import os
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 from .base import LLMProvider, LLMResponse, Message, ToolCall, ToolDef
 from .retry import call_with_retries
@@ -78,6 +78,7 @@ class AnthropicProvider(LLMProvider):
         max_tokens: int = 1024,
         tools: Optional[list[ToolDef]] = None,
         tool_choice: Optional[str] = None,
+        on_delta: Optional[Callable[[str], None]] = None,
     ) -> LLMResponse:
         kwargs = {
             "model": self.model,
@@ -87,6 +88,12 @@ class AnthropicProvider(LLMProvider):
         }
         if system_prompt:
             kwargs["system"] = system_prompt
+
+        if on_delta and not tools:
+            try:
+                return self._complete_streaming(kwargs, on_delta)
+            except Exception:
+                pass  # fall back to a normal request
         if tools:
             kwargs["tools"] = [
                 {
@@ -123,6 +130,26 @@ class AnthropicProvider(LLMProvider):
             raw_response=response.model_dump(),
             tool_calls=tool_calls,
             latency_ms=latency_ms,
+        )
+
+    def _complete_streaming(self, kwargs: dict, on_delta) -> LLMResponse:
+        """Stream a text-only completion, emitting fragments via on_delta."""
+        start = time.time()
+        with self.client.messages.stream(**kwargs) as stream:
+            for fragment in stream.text_stream:
+                on_delta(fragment)
+            message = stream.get_final_message()
+
+        text = "".join(b.text for b in message.content if b.type == "text")
+        return LLMResponse(
+            content=text,
+            model=message.model,
+            usage={
+                "input_tokens": message.usage.input_tokens,
+                "output_tokens": message.usage.output_tokens,
+            },
+            raw_response=message.model_dump(),
+            latency_ms=(time.time() - start) * 1000,
         )
 
     @property

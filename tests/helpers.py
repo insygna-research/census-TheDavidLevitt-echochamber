@@ -25,17 +25,24 @@ class FakeProvider(LLMProvider):
         max_tokens=1024,
         tools=None,
         tool_choice=None,
+        on_delta=None,
     ):
         self.calls.append({
             "messages": list(messages),
             "system_prompt": system_prompt,
             "tools": tools,
             "tool_choice": tool_choice,
+            "on_delta": on_delta,
         })
         if not self._responses:
             raise AssertionError(f"{self.name} ran out of scripted responses")
         scripted = self._responses.pop(0)
         if isinstance(scripted, str):
+            if on_delta and not tools:
+                # Stream word-by-word like a real provider would
+                words = scripted.split(" ")
+                for i, word in enumerate(words):
+                    on_delta(word + (" " if i < len(words) - 1 else ""))
             return LLMResponse(
                 content=scripted,
                 model=self.model,

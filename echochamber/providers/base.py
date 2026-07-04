@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 
 @dataclass
@@ -62,6 +62,7 @@ class LLMProvider(ABC):
         max_tokens: int = 1024,
         tools: Optional[list[ToolDef]] = None,
         tool_choice: Optional[str] = None,
+        on_delta: Optional[Callable[[str], None]] = None,
     ) -> LLMResponse:
         """
         Generate a completion from the LLM.
@@ -73,6 +74,10 @@ class LLMProvider(ABC):
             max_tokens: Maximum tokens in response
             tools: Tools the model may call (ignored if supports_tools is False)
             tool_choice: Name of a tool the model must call
+            on_delta: Called with each text fragment as it streams. Providers
+                stream when possible (text-only calls) and fall back to a
+                normal request otherwise; the returned LLMResponse is complete
+                either way.
 
         Returns:
             Normalized LLMResponse

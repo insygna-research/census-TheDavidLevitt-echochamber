@@ -12,7 +12,7 @@ Native tool calling is supported on both.
 
 import os
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 from .base import LLMProvider, LLMResponse, Message, ToolCall, ToolDef
 from .retry import call_with_retries
@@ -117,6 +117,7 @@ class GeminiProvider(LLMProvider):
         max_tokens: int = 1024,
         tools: Optional[list[ToolDef]] = None,
         tool_choice: Optional[str] = None,
+        on_delta: Optional[Callable[[str], None]] = None,
     ) -> LLMResponse:
         config: dict = {
             "temperature": temperature,
@@ -142,6 +143,12 @@ class GeminiProvider(LLMProvider):
                 }}
 
         contents = self._to_contents(messages) or [{"role": "user", "parts": [{"text": "Begin."}]}]
+
+        if on_delta and not tools:
+            try:
+                return self._complete_streaming(contents, config, on_delta)
+            except Exception:
+                pass  # fall back to a normal request
 
         start = time.time()
         response = call_with_retries(
@@ -181,6 +188,43 @@ class GeminiProvider(LLMProvider):
             raw_response=None,
             tool_calls=tool_calls,
             latency_ms=latency_ms,
+        )
+
+    def _complete_streaming(self, contents, config, on_delta) -> LLMResponse:
+        """Stream a text-only completion, emitting fragments via on_delta."""
+        start = time.time()
+        stream = call_with_retries(
+            lambda: self.client.models.generate_content_stream(
+                model=self.model, contents=contents, config=config,
+            )
+        )
+        parts: list[str] = []
+        last_meta = None
+        for chunk in stream:
+            meta = getattr(chunk, "usage_metadata", None)
+            if meta:
+                last_meta = meta
+            try:
+                fragment = chunk.text
+            except Exception:
+                fragment = None
+            if fragment:
+                parts.append(fragment)
+                on_delta(fragment)
+
+        usage = None
+        if last_meta:
+            usage = {
+                "input_tokens": last_meta.prompt_token_count or 0,
+                "output_tokens": (last_meta.candidates_token_count or 0)
+                + (getattr(last_meta, "thoughts_token_count", 0) or 0),
+            }
+        return LLMResponse(
+            content="".join(parts),
+            model=self.model,
+            usage=usage,
+            raw_response=None,
+            latency_ms=(time.time() - start) * 1000,
         )
 
     @property

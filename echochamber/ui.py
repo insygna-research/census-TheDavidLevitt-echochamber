@@ -306,11 +306,14 @@ def run_debate_ui(topic, position, pros_provider, pros_model, pros_instr,
     def on_turn(speaker, role, content):
         events.put(("turn", (speaker, role, content)))
 
+    def on_delta(speaker, role, fragment):
+        events.put(("delta", (speaker, role, fragment)))
+
     def worker():
         try:
             outcome = run_debate(
                 spec, meter=meter,
-                on_turn=on_turn, on_status=on_status,
+                on_turn=on_turn, on_status=on_status, on_delta=on_delta,
                 should_stop=stop_event.is_set,
             )
             record["status"] = (
@@ -326,48 +329,79 @@ def run_debate_ui(topic, position, pros_provider, pros_model, pros_instr,
     threading.Thread(target=worker, daemon=True).start()
 
     status = "### 🏁 Starting debate…"
+    stream_speaker = None  # (speaker, role) currently generating
+    stream_text = ""
+
+    def chat_view():
+        """Committed turns plus the live-typing bubble, if any."""
+        if not stream_speaker:
+            return chat
+        speaker, role = stream_speaker
+        return chat + [{
+            "role": "assistant",
+            "content": f"**{ROLE_EMOJI.get(role, '💬')} {speaker} ({role})**\n\n{stream_text}▌",
+        }]
+
     try:
         yield status, _fmt_tokens(meter, budget), chat, ""
 
         while True:
+            # Wait for one event, then drain whatever else is queued so a
+            # burst of stream deltas becomes a single UI update.
             try:
-                kind, payload = events.get(timeout=0.5)
+                batch = [events.get(timeout=0.4)]
             except queue.Empty:
-                # No new event — refresh the live token/cost ticker
                 yield status, _fmt_tokens(meter, budget), gr.skip(), gr.skip()
                 continue
+            while True:
+                try:
+                    batch.append(events.get_nowait())
+                except queue.Empty:
+                    break
 
-            if kind == "status":
-                stage, name, role, provider_name = payload
-                status = (f"### {ROLE_EMOJI.get(role, '💬')} Now running: **{name}** "
-                          f"({stage})\n`{provider_name}`")
-                yield status, _fmt_tokens(meter, budget), gr.skip(), gr.skip()
+            finished = None
+            for kind, payload in batch:
+                if kind == "status":
+                    stage, name, role, provider_name = payload
+                    status = (f"### {ROLE_EMOJI.get(role, '💬')} Now running: **{name}** "
+                              f"({stage})\n`{provider_name}`")
+                    stream_speaker, stream_text = None, ""
+                elif kind == "delta":
+                    speaker, role, fragment = payload
+                    if stream_speaker != (speaker, role):
+                        stream_speaker, stream_text = (speaker, role), ""
+                    stream_text += fragment
+                elif kind == "turn":
+                    speaker, role, content = payload
+                    stream_speaker, stream_text = None, ""
+                    chat = chat + [{
+                        "role": "assistant",
+                        "content": f"**{ROLE_EMOJI.get(role, '💬')} {speaker} ({role})**\n\n{content}",
+                    }]
+                elif kind in ("error", "done"):
+                    finished = (kind, payload)
 
-            elif kind == "turn":
-                speaker, role, content = payload
-                chat = chat + [{
-                    "role": "assistant",
-                    "content": f"**{ROLE_EMOJI.get(role, '💬')} {speaker} ({role})**\n\n{content}",
-                }]
-                yield status, _fmt_tokens(meter, budget), chat, gr.skip()
+            if finished is None:
+                yield status, _fmt_tokens(meter, budget), chat_view(), gr.skip()
+                continue
 
-            elif kind == "error":
+            kind, payload = finished
+            if kind == "error":
                 yield f"### ❌ Error: {payload}", _fmt_tokens(meter, budget), chat, ""
                 return
 
-            elif kind == "done":
-                outcome = payload
-                result = outcome.result
-                winner = (result.winner or "undecided").upper()
-                verdict = (
-                    f"## 🏛️ Verdict: **{winner}**\n"
-                    f"- Termination: `{result.termination_reason.value}` "
-                    f"after {result.rounds_completed} round(s)\n"
-                    f"- Transcript: `{outcome.transcript_path}`\n\n"
-                    f"```\n{outcome.usage.summary()}\n```"
-                )
-                yield "### ✅ Debate complete", _fmt_tokens(meter, budget), chat, verdict
-                return
+            outcome = payload
+            result = outcome.result
+            winner = (result.winner or "undecided").upper()
+            verdict = (
+                f"## 🏛️ Verdict: **{winner}**\n"
+                f"- Termination: `{result.termination_reason.value}` "
+                f"after {result.rounds_completed} round(s)\n"
+                f"- Transcript: `{outcome.transcript_path}`\n\n"
+                f"```\n{outcome.usage.summary()}\n```"
+            )
+            yield "### ✅ Debate complete", _fmt_tokens(meter, budget), chat, verdict
+            return
     except GeneratorExit:
         # Browser disconnected mid-run: honor the on-close preference.
         if record["status"] == "running":
