@@ -27,17 +27,41 @@ def test_footprint_free_for_local():
     assert fp["tokens"] > 0
 
 
-def test_estimate_md_money_is_bold_red_with_disclaimer():
-    cheap = estimate_md("gemini", "gemini-2.5-flash", "gemini", "gemini-2.5-flash",
-                        "gemini", "gemini-2.5-flash", 1, 1, 200_000)
-    assert "🟢" in cheap
-    assert "color:#f87171" in cheap          # money is red even when cheap
-    assert "rough approximation" in cheap    # disclaimer present
-    assert "hard token budget is strongly recommended" in cheap
+def test_estimate_md_colors_follow_funding_class():
+    # Gemini bills against the sample credit pool → green "credits"
+    credit = estimate_md("gemini", "gemini-2.5-flash", "gemini", "gemini-2.5-flash",
+                         "gemini", "gemini-2.5-flash", 1, 1, 200_000)
+    assert "🟢" in credit
+    assert "color:#4ade80" in credit and "credits" in credit
+    assert "color:#f87171" not in credit     # no paid-API money in this config
+    assert "rough approximation" in credit   # disclaimer present
+    assert "hard token budget is strongly recommended" in credit
+
+    # Anthropic has no pool in the sample → red "paid API"; big config → 🔴
     pricey = estimate_md("anthropic", "claude-opus-4-20250514", "anthropic",
                          "claude-opus-4-20250514", "anthropic", "claude-opus-4-20250514",
                          8, 10, 20_000_000)
-    assert "🔴" in pricey and "color:#f87171" in pricey
+    assert "🔴" in pricey
+    assert "color:#f87171" in pricey and "paid API" in pricey
+
+
+def test_estimate_md_mixed_classes_shown_side_by_side():
+    mixed = estimate_md("gemini", "gemini-2.5-flash", "gemini", "gemini-2.5-flash",
+                        "anthropic", "claude-sonnet-4-20250514", 2, 1, 200_000)
+    assert "color:#4ade80" in mixed and "credits" in mixed        # advocates on credits
+    assert "color:#f87171" in mixed and "paid API" in mixed       # judge on cash
+    assert mixed.index("paid API") < mixed.index("credits")       # real listed first
+
+
+def test_funding_class_mapping():
+    from echochamber.recommendations import funding_class
+    sample = load_apa_data()
+    assert funding_class("gemini", sample.credits) == "credit"
+    assert funding_class("anthropic", sample.credits) == "real"
+    assert funding_class("lmstudio", sample.credits) == "included"
+    # Monthly/subscription-style pools classify as included
+    subs = {"claude-sub": {"name": "Claude subscription", "total": 20, "period": "month"}}
+    assert funding_class("anthropic", subs) == "included"
 
 
 def test_estimate_md_warns_when_budget_below_estimate():

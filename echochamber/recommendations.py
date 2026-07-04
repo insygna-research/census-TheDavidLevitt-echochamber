@@ -156,6 +156,28 @@ def load_apa_data(path: Optional[str] = None) -> ApaData:
     )
 
 
+def funding_class(provider: str, credits: dict) -> str:
+    """Source-of-funds class for a provider: 'real' | 'credit' | 'included'.
+
+    Mirrors AgentStable's costClass idea: not how much a call costs, but
+    whose money it spends. Local models and subscription-style monthly
+    pools are 'included'; finite credit pools are 'credit'; everything
+    else is out-of-pocket 'real'.
+    """
+    if provider == "lmstudio":
+        return "included"
+    keywords = _CREDIT_KEYWORDS.get(provider, ())
+    for key, pool in credits.items():
+        if not isinstance(pool, dict) or not pool.get("total"):
+            continue
+        haystack = f"{key} {pool.get('name', '')}".lower()
+        if any(k in haystack for k in keywords):
+            if pool.get("period") == "month" or "sub" in key.lower():
+                return "included"
+            return "credit"
+    return "real"
+
+
 def credit_note_for_provider(provider: str, credits: dict) -> str:
     """Source-of-funds note if this provider bills against a credit pool."""
     keywords = _CREDIT_KEYWORDS.get(provider, ())

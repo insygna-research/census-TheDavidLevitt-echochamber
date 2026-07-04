@@ -46,15 +46,38 @@ except ImportError:
 
 from collections import Counter
 
-from .core.costs import estimate_debate_footprint
+from .core.costs import estimate_debate_footprint, estimate_run_cost
 from .core.runner import DebateSpec, resolve_model, run_debate
 from .core.session import TerminationReason
 from .core.usage import UsageMeter
-from .recommendations import credits_callout, load_apa_data, recommend_for_debate
+from .recommendations import (
+    credits_callout,
+    funding_class,
+    load_apa_data,
+    recommend_for_debate,
+)
 
 PROVIDERS = ["lmstudio", "anthropic", "openai", "together", "gemini"]
 DEFAULT_PROVIDER = os.environ.get("ECHOCHAMBER_DEFAULT_PROVIDER", "lmstudio")
 ROLE_EMOJI = {"prosecution": "⚖️", "defense": "🛡️", "moderator": "👨‍⚖️", "system": "⚙️"}
+
+# Source-of-funds palette (matches the AgentStable dashboard convention):
+# red = out-of-pocket, green = finite credits, blue = subscription/included.
+FUNDING_STYLE = {
+    "real": ("#f87171", "paid API"),
+    "credit": ("#4ade80", "credits"),
+    "included": ("#60a5fa", "subscription"),
+}
+
+
+def _fund_class(provider: str) -> str:
+    return funding_class(provider, _apa.credits if _apa else {})
+
+
+def _fund_span(cls: str, amount: str, label: str = None) -> str:
+    color, default_label = FUNDING_STYLE.get(cls, FUNDING_STYLE["real"])
+    return (f"<span style='color:{color};font-weight:bold'>"
+            f"{amount} {label or default_label}</span>")
 
 PROVIDER_ENV_KEYS = {
     "anthropic": "ANTHROPIC_API_KEY",
@@ -103,7 +126,8 @@ def _recs_markdown() -> str:
         lines.append(f"**{ROLE_EMOJI[role]} {role.capitalize()}**")
         for r in items:
             price = f"${r.price_in:g} / ${r.price_out:g} per 1M" if r.price_in is not None else "price unknown"
-            lines.append(f"{r.rank}. `{r.model}` ({r.provider}) — {price}" +
+            price_tag = _fund_span(_fund_class(r.provider), price)
+            lines.append(f"{r.rank}. `{r.model}` ({r.provider}) — {price_tag}" +
                          (f" · bar: {r.benchmark}" if r.benchmark else ""))
             lines.append(f"   ↳ {r.justification}")
             if r.funding_note:
@@ -136,14 +160,31 @@ def estimate_md(pros_provider, pros_model, def_provider, def_model,
 
     minutes = fp["seconds"] / 60
     time_str = f"~{minutes:.0f} min" if minutes >= 1 else f"~{fp['seconds']:.0f}s"
-    if fp["cost_max"] == 0:
-        cost_str = "free (local models)"
-    else:
-        cost_str = (
-            f"<span style='color:#f87171;font-weight:bold'>"
-            f"${fp['cost_min']:.2f}–${fp['cost_max']:.2f}</span>"
-        )
-    flag = "🔴" if fp["cost_max"] > 1.0 else "🟢"
+
+    # Split the money estimate by source of funds (dashboard convention:
+    # red = paid API, green = credits, blue = subscription); if the roles
+    # mix classes, each class estimate appears side by side.
+    _, _, breakdown = estimate_run_cost(*models, max_rounds=int(rounds or 1))
+    role_providers = {
+        "prosecution": pros_provider, "defense": def_provider, "moderator": mod_provider,
+    }
+    per_class: dict = {}
+    for role_key, data in breakdown.items():
+        cls = _fund_class(role_providers[role_key])
+        per_class[cls] = per_class.get(cls, 0.0) + data["cost"] * fp["iterations"]
+
+    parts = []
+    for cls in ("real", "credit", "included"):
+        if cls not in per_class:
+            continue
+        mid = per_class[cls]
+        if mid == 0:
+            parts.append(_fund_span(cls, "free", "(local)"))
+        else:
+            parts.append(_fund_span(cls, f"${mid * 0.5:.2f}–${mid * 1.5:.2f}"))
+    cost_str = " · ".join(parts) if parts else "free (local models)"
+    real_max = per_class.get("real", 0.0) * 1.5
+    flag = "🔴" if real_max > 1.0 else "🟢"
     lines = [
         f"**Estimated footprint:** {flag} ~{fp['tokens']:,} tokens · {cost_str} · "
         f"{time_str} ({fp['calls']} model calls, {fp['iterations']} iteration(s))"
@@ -294,13 +335,26 @@ def save_keys(anthropic_key: str, openai_key: str, together_key: str, gemini_key
 
 # ------------------------------------------------------------ debate running
 
+def _cost_spans(meter: UsageMeter) -> str:
+    """Metered cost split by funding class, colored per the dashboard scheme."""
+    totals: dict = {}
+    for e in list(meter.events):
+        cls = _fund_class(e.provider.split("/")[0])
+        totals[cls] = totals.get(cls, 0.0) + e.cost_usd
+    parts = [
+        _fund_span(cls, f"${totals[cls]:.4f}")
+        for cls in ("real", "credit", "included") if cls in totals
+    ]
+    return " + ".join(parts) if parts else "$0.0000"
+
+
 def _fmt_tokens(meter: UsageMeter, budget: int | None) -> str:
     tin, tout = meter.total_tokens()
     total = tin + tout
     budget_str = f" / {budget:,} budget" if budget else ""
     pct = f" ({100 * total / budget:.0f}%)" if budget else ""
     return (f"**Tokens burned:** {total:,}{budget_str}{pct} · "
-            f"{tin:,} in / {tout:,} out · **Cost:** ${meter.total_cost():.4f}")
+            f"{tin:,} in / {tout:,} out · **Cost:** {_cost_spans(meter)}")
 
 
 def stop_debate():
@@ -508,6 +562,7 @@ def run_debate_ui(topic, position, pros_provider, pros_model, pros_instr,
                     f"(`{o.result.termination_reason.value}`, "
                     f"{o.result.rounds_completed} round(s)) — `{o.transcript_path}`"
                 )
+            detail_lines.append(f"\n**Total cost:** {_cost_spans(meter)}")
             detail_lines.append(f"\n```\n{meter.summary()}\n```")
             # The headline doubles as the top status banner so the outcome is
             # unmissable in the final frame.
