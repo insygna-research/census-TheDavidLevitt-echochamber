@@ -18,6 +18,7 @@ except ImportError:
 
 from .core import create_case_folder
 from .core.runner import DebateSpec, run_debate
+from .core.usage import UsageMeter
 
 
 def parse_args():
@@ -136,6 +137,13 @@ Examples:
         type=int,
         default=3,
         help="Maximum number of debate rounds (default: 3)",
+    )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Repeat the debate N times and tally the verdicts (default: 1)",
     )
     parser.add_argument(
         "--allow-concession",
@@ -280,8 +288,21 @@ def main():
         print("Web search: Disabled")
     print()
 
+    iterations = max(1, args.iterations)
+    # One shared meter: the token budget and usage log span all iterations
+    meter = UsageMeter(hard_limit_tokens=spec.max_total_tokens)
+    usage_log = spec.usage_log
+    spec.usage_log = None  # written once at the end, not per iteration
+
+    outcomes = []
     try:
-        outcome = run_debate(spec)
+        for i in range(1, iterations + 1):
+            if iterations > 1:
+                print(f"\n{'=' * 60}\nITERATION {i}/{iterations}\n{'=' * 60}")
+            outcome = run_debate(spec, meter=meter)
+            outcomes.append(outcome)
+            if outcome.result.termination_reason.value in ("token_budget", "cancelled"):
+                break
     except KeyboardInterrupt:
         print("\n\nSession interrupted by user.")
         sys.exit(1)
@@ -301,7 +322,7 @@ def main():
         traceback.print_exc()
         sys.exit(1)
 
-    result = outcome.result
+    result = outcomes[-1].result
 
     # Print summary
     print("\n" + "=" * 60)
@@ -309,13 +330,20 @@ def main():
     print("=" * 60)
     print(f"Rounds completed: {result.rounds_completed}")
     print(f"Termination: {result.termination_reason.value}")
-    if result.winner:
+    if len(outcomes) > 1:
+        from collections import Counter
+        tally = Counter((o.result.winner or "undecided") for o in outcomes)
+        print("Verdicts: " + " · ".join(f"{w}: {c}" for w, c in tally.most_common()))
+    elif result.winner:
         print(f"Winner: {result.winner.upper()}")
     else:
         print("Winner: UNDECIDED")
 
     print()
-    print(outcome.usage.summary())
+    print(meter.summary())
+    if usage_log:
+        meter.write_jsonl(usage_log)
+        print(f"Usage events appended to: {usage_log}")
 
 
 if __name__ == "__main__":

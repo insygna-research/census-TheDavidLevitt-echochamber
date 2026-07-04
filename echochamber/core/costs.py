@@ -153,6 +153,41 @@ def estimate_run_cost(
     return min_cost, max_cost, breakdown
 
 
+def estimate_debate_footprint(
+    prosecution_model: str,
+    defense_model: str,
+    moderator_model: str,
+    max_rounds: int,
+    iterations: int = 1,
+    evidence_tokens: int = 0,
+    seconds_per_call: float = 8.0,
+) -> dict:
+    """
+    Rough total footprint for a debate configuration: tokens, dollars,
+    model calls, and wall-clock seconds, scaled by iterations.
+
+    Clock time is a heuristic (API models average ~8s/call; local models
+    vary wildly) — treat it as an order of magnitude, not a promise.
+    """
+    iterations = max(1, int(iterations))
+    min_cost, max_cost, breakdown = estimate_run_cost(
+        prosecution_model, defense_model, moderator_model, max_rounds, evidence_tokens
+    )
+    tokens_per_run = sum(
+        d["input_tokens"] + d["output_tokens"] for d in breakdown.values()
+    )
+    # opening + per round (prosecution, defense, evaluation) + final ruling
+    calls_per_run = 2 + 3 * max_rounds
+    return {
+        "iterations": iterations,
+        "tokens": tokens_per_run * iterations,
+        "cost_min": min_cost * iterations,
+        "cost_max": max_cost * iterations,
+        "calls": calls_per_run * iterations,
+        "seconds": calls_per_run * iterations * seconds_per_call,
+    }
+
+
 def format_cost_estimate(
     min_cost: float,
     max_cost: float,

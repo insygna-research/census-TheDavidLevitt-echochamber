@@ -44,9 +44,13 @@ try:
 except ImportError:
     pass
 
-from .core.runner import DebateSpec, run_debate
+from collections import Counter
+
+from .core.costs import estimate_debate_footprint
+from .core.runner import DebateSpec, resolve_model, run_debate
+from .core.session import TerminationReason
 from .core.usage import UsageMeter
-from .recommendations import load_apa_data, recommend_for_debate
+from .recommendations import credits_callout, load_apa_data, recommend_for_debate
 
 PROVIDERS = ["lmstudio", "anthropic", "openai", "together", "gemini"]
 DEFAULT_PROVIDER = os.environ.get("ECHOCHAMBER_DEFAULT_PROVIDER", "lmstudio")
@@ -89,7 +93,12 @@ except Exception:
 def _recs_markdown() -> str:
     if not _recs or not any(_recs.values()):
         return "_No APA data available._"
-    lines = [f"_Source: {_apa.source}_\n"]
+    lines = []
+    callout = credits_callout(_apa) if _apa else ""
+    if callout:
+        lines.append(callout)
+        lines.append("")
+    lines.append(f"_Source: {_apa.source}_\n")
     for role, items in _recs.items():
         lines.append(f"**{ROLE_EMOJI[role]} {role.capitalize()}**")
         for r in items:
@@ -97,8 +106,61 @@ def _recs_markdown() -> str:
             lines.append(f"{r.rank}. `{r.model}` ({r.provider}) — {price}" +
                          (f" · bar: {r.benchmark}" if r.benchmark else ""))
             lines.append(f"   ↳ {r.justification}")
+            if r.funding_note:
+                lines.append(f"   💰 {r.funding_note}")
         lines.append("")
     return "\n".join(lines)
+
+
+def estimate_md(pros_provider, pros_model, def_provider, def_model,
+                mod_provider, mod_model, rounds, iterations) -> str:
+    """Live footprint estimate: tokens, dollars, wall-clock. Red above $1."""
+    try:
+        models = [
+            resolve_model(pros_provider, _text(pros_model) or None, "advocate"),
+            resolve_model(def_provider, _text(def_model) or None, "advocate"),
+            resolve_model(mod_provider, _text(mod_model) or None, "moderator"),
+        ]
+        fp = estimate_debate_footprint(
+            *models, max_rounds=int(rounds or 1), iterations=int(iterations or 1),
+        )
+    except Exception as e:
+        return f"_Estimate unavailable: {e}_"
+
+    minutes = fp["seconds"] / 60
+    time_str = f"~{minutes:.0f} min" if minutes >= 1 else f"~{fp['seconds']:.0f}s"
+    if fp["cost_max"] == 0:
+        cost_str = "free (local models)"
+    else:
+        cost_str = f"${fp['cost_min']:.2f}–${fp['cost_max']:.2f}"
+    body = (f"~{fp['tokens']:,} tokens · {cost_str} · {time_str} "
+            f"({fp['calls']} model calls, {fp['iterations']} iteration(s))")
+    if fp["cost_max"] > 1.0:
+        return (f"**Estimated footprint:** 🔴 "
+                f"<span style='color:#f87171;font-weight:bold'>{body}</span>")
+    return f"**Estimated footprint:** 🟢 {body}"
+
+
+def _position_outcome(winner, position) -> str:
+    if winner == "prosecution":
+        return f"position upheld: “{position}”"
+    if winner == "defense":
+        return f"position rejected: “{position}”"
+    return f"no decision reached on “{position}”"
+
+
+def verdict_headline(winners: list, position: str) -> str:
+    """Prominent verdict line, aggregated across iterations."""
+    if not winners:
+        return "## 🏛️ No verdict"
+    if len(winners) == 1:
+        w = winners[0] or "undecided"
+        return f"## 🏛️ Verdict: **{w.upper()}** — {_position_outcome(w, position)}"
+    tally = Counter(w or "undecided" for w in winners)
+    top, n = tally.most_common(1)[0]
+    detail = " · ".join(f"{w}: {c}" for w, c in tally.most_common())
+    return (f"## 🏛️ Verdict across {len(winners)} iterations: **{top.upper()} {n}/{len(winners)}** "
+            f"— {_position_outcome(top, position)}\n({detail})")
 
 
 def _apply_recs(rank: int):
@@ -263,9 +325,10 @@ def run_debate_ui(topic, position, pros_provider, pros_model, pros_instr,
                   def_provider, def_model, def_instr,
                   mod_provider, mod_model, mod_instr,
                   case_folder, context_strategy,
-                  rounds, enable_search, token_budget, on_close):
+                  rounds, iterations, enable_search, token_budget, on_close):
     """Generator: streams (status, tokens, chat, verdict) updates while the debate runs."""
     chat: list[dict] = []
+    iters = max(1, int(iterations or 1))
 
     if not topic or not position:
         yield "### ⚠️ Topic and position are required.", "", chat, ""
@@ -310,18 +373,33 @@ def run_debate_ui(topic, position, pros_provider, pros_model, pros_instr,
         events.put(("delta", (speaker, role, fragment)))
 
     def worker():
+        outcomes = []
         try:
-            outcome = run_debate(
-                spec, meter=meter,
-                on_turn=on_turn, on_status=on_status, on_delta=on_delta,
-                should_stop=stop_event.is_set,
+            for i in range(1, iters + 1):
+                if stop_event.is_set():
+                    break
+                if iters > 1:
+                    events.put(("iter", (i, iters)))
+                outcome = run_debate(
+                    spec, meter=meter,
+                    on_turn=on_turn, on_status=on_status, on_delta=on_delta,
+                    should_stop=stop_event.is_set,
+                )
+                outcomes.append(outcome)
+                # A budget/cancel stop applies to the whole batch, not just
+                # this iteration.
+                if outcome.result.termination_reason in (
+                    TerminationReason.TOKEN_BUDGET, TerminationReason.CANCELLED,
+                ):
+                    break
+            winners = [o.result.winner for o in outcomes]
+            tally = Counter(w or "undecided" for w in winners)
+            record["status"] = "finished — " + (
+                ", ".join(f"{w} {c}/{len(winners)}" for w, c in tally.most_common())
+                if winners else "no runs"
             )
-            record["status"] = (
-                f"finished — {(outcome.result.winner or 'undecided').upper()} "
-                f"({outcome.result.termination_reason.value})"
-            )
-            record["transcript"] = str(outcome.transcript_path or "")
-            events.put(("done", outcome))
+            record["transcript"] = str(outcomes[-1].transcript_path or "") if outcomes else ""
+            events.put(("done", outcomes))
         except Exception as e:
             record["status"] = f"error: {str(e)[:120]}"
             events.put(("error", str(e)))
@@ -361,7 +439,13 @@ def run_debate_ui(topic, position, pros_provider, pros_model, pros_instr,
 
             finished = None
             for kind, payload in batch:
-                if kind == "status":
+                if kind == "iter":
+                    i, n = payload
+                    chat = chat + [{
+                        "role": "assistant",
+                        "content": f"⚙️ — **Iteration {i} of {n}** —",
+                    }]
+                elif kind == "status":
                     stage, name, role, provider_name = payload
                     status = (f"### {ROLE_EMOJI.get(role, '💬')} Now running: **{name}** "
                               f"({stage})\n`{provider_name}`")
@@ -390,17 +474,21 @@ def run_debate_ui(topic, position, pros_provider, pros_model, pros_instr,
                 yield f"### ❌ Error: {payload}", _fmt_tokens(meter, budget), chat, ""
                 return
 
-            outcome = payload
-            result = outcome.result
-            winner = (result.winner or "undecided").upper()
-            verdict = (
-                f"## 🏛️ Verdict: **{winner}**\n"
-                f"- Termination: `{result.termination_reason.value}` "
-                f"after {result.rounds_completed} round(s)\n"
-                f"- Transcript: `{outcome.transcript_path}`\n\n"
-                f"```\n{outcome.usage.summary()}\n```"
-            )
-            yield "### ✅ Debate complete", _fmt_tokens(meter, budget), chat, verdict
+            outcomes = payload
+            winners = [o.result.winner for o in outcomes]
+            headline = verdict_headline(winners, position)
+            detail_lines = [headline, ""]
+            for i, o in enumerate(outcomes, 1):
+                prefix = f"Iteration {i}: " if len(outcomes) > 1 else ""
+                detail_lines.append(
+                    f"- {prefix}**{(o.result.winner or 'undecided').upper()}** "
+                    f"(`{o.result.termination_reason.value}`, "
+                    f"{o.result.rounds_completed} round(s)) — `{o.transcript_path}`"
+                )
+            detail_lines.append(f"\n```\n{meter.summary()}\n```")
+            # The headline doubles as the top status banner so the outcome is
+            # unmissable in the final frame.
+            yield headline, _fmt_tokens(meter, budget), chat, "\n".join(detail_lines)
             return
     except GeneratorExit:
         # Browser disconnected mid-run: honor the on-close preference.
@@ -476,10 +564,28 @@ def _debate_tab():
                         lambda: _apply_recs(2), outputs=rec_outputs
                     )
 
-            rounds = gr.Slider(1, 8, value=2, step=1, label="Max rounds")
+            with gr.Row():
+                rounds = gr.Slider(1, 8, value=2, step=1, label="Max rounds", scale=2)
+                iterations = gr.Number(
+                    label="Iterations (repeat the debate)",
+                    value=1, precision=0, minimum=1, maximum=20, scale=1,
+                )
             enable_search = gr.Checkbox(label="Enable web search", value=False)
+
+            estimate = gr.Markdown(estimate_md(
+                DEFAULT_PROVIDER, "", DEFAULT_PROVIDER, "", DEFAULT_PROVIDER, "", 2, 1,
+            ))
+            estimate_inputs = [
+                role_inputs["prosecution"][0], role_inputs["prosecution"][1],
+                role_inputs["defense"][0], role_inputs["defense"][1],
+                role_inputs["moderator"][0], role_inputs["moderator"][1],
+                rounds, iterations,
+            ]
+            for component in estimate_inputs:
+                component.change(estimate_md, inputs=estimate_inputs, outputs=[estimate])
+
             token_budget = gr.Number(
-                label="Hard token budget (total across all agents)",
+                label="Hard token budget (total across all agents and iterations)",
                 value=200_000, precision=0,
             )
             on_close = gr.Radio(
@@ -504,7 +610,7 @@ def _debate_tab():
     inputs = [topic, position]
     for role in ("prosecution", "defense", "moderator"):
         inputs.extend(role_inputs[role])
-    inputs.extend([case_folder, context_strategy, rounds, enable_search, token_budget, on_close])
+    inputs.extend([case_folder, context_strategy, rounds, iterations, enable_search, token_budget, on_close])
 
     # The running-flag is toggled by dedicated js-only listeners so the main
     # event's input payload is never transformed client-side.

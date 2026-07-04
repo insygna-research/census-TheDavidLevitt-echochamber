@@ -75,7 +75,7 @@ def test_run_debate_ui_tolerates_untouched_none_inputs():
         "lmstudio", None, None,
         "lmstudio", None, None,
         None, None,  # case folder + context strategy untouched
-        1, False, None, None,
+        1, None, False, None, None,  # iterations untouched too
     )
     status, tokens, chat, verdict = next(gen)
     assert "Starting debate" in status

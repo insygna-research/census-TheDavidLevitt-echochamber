@@ -29,6 +29,14 @@
     "gpt-4o": { "in": 2.5, "out": 10.0 },
     "gpt-4o-mini": { "in": 0.15, "out": 0.6 }
   },
+  "credits": {
+    "gcp-credits": {
+      "name": "GCP free-trial credits (Gemini via Vertex)",
+      "total": 200,
+      "until": "2026-07-15",
+      "note": "Gemini/Vertex spend bills against these credits, not your card — burn them before they expire."
+    }
+  },
   "cutoffs": {
     "reasoning": {
       "min": 50,

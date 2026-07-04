@@ -59,6 +59,16 @@ def provider_for_model(model: str) -> Optional[str]:
     return None
 
 
+# Which credit-pool descriptions apply to which EchoChamber provider —
+# matched against pool keys/names from an APA credits table.
+_CREDIT_KEYWORDS = {
+    "gemini": ("gcp", "gemini", "vertex", "google"),
+    "anthropic": ("anthropic", "claude"),
+    "openai": ("openai", "gpt"),
+    "together": ("together",),
+}
+
+
 @dataclass
 class Recommendation:
     """One recommended model for a debate role."""
@@ -70,6 +80,7 @@ class Recommendation:
     price_in: Optional[float] = None   # $/1M input tokens
     price_out: Optional[float] = None  # $/1M output tokens
     benchmark: str = ""                # the quality bar this role screens on
+    funding_note: str = ""             # source-of-funds: credits this model bills against
 
     def label(self) -> str:
         price = (
@@ -83,10 +94,11 @@ class Recommendation:
 
 @dataclass
 class ApaData:
-    """Parsed APA export: role selections, prices, and quality cutoffs."""
+    """Parsed APA export: role selections, prices, cutoffs, credit pools."""
     roles: dict = field(default_factory=dict)
     prices: dict = field(default_factory=dict)
     cutoffs: dict = field(default_factory=dict)
+    credits: dict = field(default_factory=dict)  # pool -> {name,total,until,note}
     source: str = ""
 
 
@@ -96,6 +108,7 @@ def _read_merged(path: Path) -> ApaData:
         roles=raw.get("roles", {}),
         prices=raw.get("prices", {}),
         cutoffs=raw.get("cutoffs", {}),
+        credits=raw.get("credits", {}),
         source=str(path),
     )
 
@@ -103,10 +116,15 @@ def _read_merged(path: Path) -> ApaData:
 def _read_dashboard_dir(path: Path) -> ApaData:
     roles = json.loads((path / "apa-roles.json").read_text()).get("roles", {})
     state = json.loads((path / "apa-state.json").read_text())
+    credits = {}
+    credits_file = path / "credits.json"
+    if credits_file.exists():
+        credits = json.loads(credits_file.read_text())
     return ApaData(
         roles=roles,
         prices=state.get("prices", {}),
         cutoffs=state.get("cutoffs", {}),
+        credits=credits,
         source=str(path),
     )
 
@@ -126,8 +144,40 @@ def load_apa_data(path: Optional[str] = None) -> ApaData:
         roles=data.get("roles", {}),
         prices=data.get("prices", {}),
         cutoffs=data.get("cutoffs", {}),
+        credits=data.get("credits", {}),
         source="bundled sample",
     )
+
+
+def credit_note_for_provider(provider: str, credits: dict) -> str:
+    """Source-of-funds note if this provider bills against a credit pool."""
+    keywords = _CREDIT_KEYWORDS.get(provider, ())
+    for key, pool in credits.items():
+        if not isinstance(pool, dict) or not pool.get("total"):
+            continue
+        haystack = f"{key} {pool.get('name', '')}".lower()
+        if any(k in haystack for k in keywords):
+            name = pool.get("name") or key
+            note = f"{name}: ${pool['total']:g} pool"
+            if pool.get("until"):
+                note += f", expires {pool['until']}"
+            detail = str(pool.get("note", "")).split("—")[0].strip()
+            if detail:
+                note += f" — {detail[:110]}"
+            return note
+    return ""
+
+
+def credits_callout(data: ApaData) -> str:
+    """One attention-grabbing line per credit pool relevant to a runnable provider."""
+    lines = []
+    seen = set()
+    for provider in _CREDIT_KEYWORDS:
+        note = credit_note_for_provider(provider, data.credits)
+        if note and note not in seen:
+            seen.add(note)
+            lines.append(f"💰 **{note}** → prefer {provider} models: they bill against credits, not your card.")
+    return "\n\n".join(lines)
 
 
 def _price_of(model: str, prices: dict) -> tuple[Optional[float], Optional[float]]:
@@ -180,6 +230,7 @@ def recommend_for_role(debate_role: str, data: ApaData, top_n: int = 2) -> list[
             price_in=price_in,
             price_out=price_out,
             benchmark=benchmark,
+            funding_note=credit_note_for_provider(provider, data.credits),
         ))
         if len(recommendations) == top_n:
             break
