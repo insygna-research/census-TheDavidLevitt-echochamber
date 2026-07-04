@@ -1,7 +1,5 @@
 # EchoChamber ⚖️
 
-![EchoChamber GUI running a live debate](docs/demo.gif)
-
 ### 📹 Full debate, live
 https://github.com/user-attachments/assets/79130956-d2f3-47c2-b596-e12a99ce815d
 
