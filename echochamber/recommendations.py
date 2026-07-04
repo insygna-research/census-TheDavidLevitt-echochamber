@@ -1,22 +1,25 @@
-"""APA model recommendations for debate roles.
+"""AgentStable model recommendations for debate roles.
 
-APA (Agent Procurement Agent) is a companion system that continuously
+AgentStable is a companion cost/performance system that continuously
 benchmarks models and maintains, per use-case role, a current winner and
-ordered fallbacks plus scraped prices and quality cutoffs. This module maps
-APA's roles onto EchoChamber's:
+ordered fallbacks plus scraped prices, quality cutoffs, and credit pools
+(source-of-funds). This module maps its roles onto EchoChamber's:
 
-    moderator (judge)        → APA "reasoning"  (evaluating arguments is hard analysis)
-    prosecution / defense    → APA "daily"      (structured argumentation, not frontier depth)
+    moderator (judge)        → "reasoning"  (evaluating arguments is hard analysis)
+    prosecution / defense    → "daily"      (structured argumentation, not frontier depth)
 
 and surfaces the top 2 models per debate role with justification, price,
-and the benchmark bar they cleared.
+and the benchmark bar they cleared. Models that bill against an active
+credit pool are promoted to #1 — spending expiring credits beats spending
+cash for equal-quality work.
 
 Data sources, in order:
   1. explicit path argument
-  2. $ECHOCHAMBER_APA_DATA (a directory with apa-roles.json + apa-state.json,
-     or a single merged JSON file {"roles": ..., "prices": ..., "cutoffs": ...})
+  2. $ECHOCHAMBER_AGENTSTABLE_DATA (or legacy $ECHOCHAMBER_APA_DATA) — a
+     directory with apa-roles.json + apa-state.json (+ credits.json), or a
+     single merged JSON file {"roles", "prices", "cutoffs", "credits"}
   3. the bundled sample (data/apa_board_sample.json) so the feature works
-     without an APA deployment
+     without an AgentStable deployment
 """
 
 import json
@@ -130,8 +133,12 @@ def _read_dashboard_dir(path: Path) -> ApaData:
 
 
 def load_apa_data(path: Optional[str] = None) -> ApaData:
-    """Load APA data from a path, $ECHOCHAMBER_APA_DATA, or the bundled sample."""
-    candidate = path or os.environ.get("ECHOCHAMBER_APA_DATA")
+    """Load AgentStable data from a path, env var, or the bundled sample."""
+    candidate = (
+        path
+        or os.environ.get("ECHOCHAMBER_AGENTSTABLE_DATA")
+        or os.environ.get("ECHOCHAMBER_APA_DATA")  # legacy name
+    )
     if candidate:
         p = Path(candidate).expanduser()
         if p.is_dir():
@@ -176,7 +183,10 @@ def credits_callout(data: ApaData) -> str:
         note = credit_note_for_provider(provider, data.credits)
         if note and note not in seen:
             seen.add(note)
-            lines.append(f"💰 **{note}** → prefer {provider} models: they bill against credits, not your card.")
+            lines.append(
+                f"💰 **AgentStable: {note}** → {provider} models are ranked first below: "
+                f"they bill against credits, not your card."
+            )
     return "\n\n".join(lines)
 
 
@@ -207,18 +217,34 @@ def recommend_for_role(debate_role: str, data: ApaData, top_n: int = 2) -> list[
     role_why = cutoff.get("why", "")
     candidates = [role_cfg.get("winner")] + list(role_cfg.get("fallbacks", []))
 
-    recommendations = []
-    for model in candidates:
-        if not model:
-            continue
+    # Collect runnable candidates in AgentStable's benchmark order
+    entries = []  # (benchmark_position, model, provider, funding_note)
+    for position, model in enumerate(m for m in candidates if m):
         provider = provider_for_model(model)
         if not provider:
             continue  # no EchoChamber provider can run it
+        entries.append((
+            position, model, provider,
+            credit_note_for_provider(provider, data.credits),
+        ))
+
+    # Source-of-funds beats benchmark order: models billing against an
+    # active credit pool are promoted ahead of cash models.
+    entries.sort(key=lambda e: (0 if e[3] else 1, e[0]))
+
+    recommendations = []
+    for position, model, provider, funding_note in entries[:top_n]:
         rank = len(recommendations) + 1
-        position = (
-            f"APA's current winner for its '{apa_role}' role"
-            if rank == 1
-            else f"APA's ranked fallback for '{apa_role}'"
+        origin = (
+            f"AgentStable's benchmark winner for '{apa_role}'"
+            if position == 0
+            else f"AgentStable's ranked fallback for '{apa_role}'"
+        )
+        promoted = funding_note and rank == 1 and position > 0
+        prefix = (
+            "Promoted to #1 — bills against your credit pool, not cash. "
+            if promoted
+            else ""
         )
         price_in, price_out = _price_of(model, data.prices)
         recommendations.append(Recommendation(
@@ -226,14 +252,12 @@ def recommend_for_role(debate_role: str, data: ApaData, top_n: int = 2) -> list[
             provider=provider,
             rank=rank,
             apa_role=apa_role,
-            justification=f"{position}. {role_why}".strip(),
+            justification=f"{prefix}{origin}. {role_why}".strip(),
             price_in=price_in,
             price_out=price_out,
             benchmark=benchmark,
-            funding_note=credit_note_for_provider(provider, data.credits),
+            funding_note=funding_note,
         ))
-        if len(recommendations) == top_n:
-            break
     return recommendations
 
 

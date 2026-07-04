@@ -27,13 +27,38 @@ def test_footprint_free_for_local():
     assert fp["tokens"] > 0
 
 
-def test_estimate_md_goes_red_above_one_dollar():
+def test_estimate_md_money_is_bold_red_with_disclaimer():
     cheap = estimate_md("gemini", "gemini-2.5-flash", "gemini", "gemini-2.5-flash",
-                        "gemini", "gemini-2.5-flash", 1, 1)
+                        "gemini", "gemini-2.5-flash", 1, 1, 200_000)
     assert "🟢" in cheap
+    assert "color:#f87171" in cheap          # money is red even when cheap
+    assert "rough approximation" in cheap    # disclaimer present
+    assert "hard token budget is strongly recommended" in cheap
     pricey = estimate_md("anthropic", "claude-opus-4-20250514", "anthropic",
-                         "claude-opus-4-20250514", "anthropic", "claude-opus-4-20250514", 8, 10)
+                         "claude-opus-4-20250514", "anthropic", "claude-opus-4-20250514",
+                         8, 10, 20_000_000)
     assert "🔴" in pricey and "color:#f87171" in pricey
+
+
+def test_estimate_md_warns_when_budget_below_estimate():
+    warned = estimate_md("gemini", "gemini-2.5-flash", "gemini", "gemini-2.5-flash",
+                         "gemini", "gemini-2.5-flash", 8, 5, 10_000)
+    assert "Warning: estimated token burn exceeds the hard limit" in warned
+    assert "verdict may not be rendered" in warned
+    fine = estimate_md("gemini", "gemini-2.5-flash", "gemini", "gemini-2.5-flash",
+                       "gemini", "gemini-2.5-flash", 1, 1, 500_000)
+    assert "Warning" not in fine
+
+
+def test_credit_backed_models_are_promoted_to_rank_one():
+    data = load_apa_data()  # bundled sample: gemini pool active
+    for role in ("prosecution", "defense", "moderator"):
+        recs = recommend_for_role(role, data)
+        assert recs[0].provider == "gemini", f"{role} #1 should be credit-backed"
+        assert recs[0].rank == 1
+        assert "Promoted to #1" in recs[0].justification
+    callout = credits_callout(data)
+    assert "AgentStable" in callout
 
 
 def test_verdict_headline_single_and_aggregate():

@@ -20,8 +20,22 @@ class TerminationReason(Enum):
     CONCESSION = "concession"
     MODERATOR_DECISION = "moderator_decision"
     TOKEN_BUDGET = "token_budget"
+    FORCED_VERDICT = "forced_verdict"  # debate cut short to reserve budget for the ruling
     CANCELLED = "cancelled"
     ERROR = "error"
+
+
+# Tokens reserved for the final ruling when force_verdict is on. Observed
+# ruling calls (history + structured verdict, thinking models included) run
+# 5-8k tokens on Gemini 2.5 Flash / Claude Haiku; 10k gives headroom.
+FORCE_VERDICT_RESERVE_TOKENS = 10_000
+
+# Extra instruction for a ruling after a forced cut-off.
+FORCED_VERDICT_NOTE = (
+    "The debate was cut short to preserve token budget for judgment. If the "
+    "final turn introduced new arguments the opposing side never had a chance "
+    "to rebut, disregard them; judge only on the fully-argued record."
+)
 
 
 class SessionCancelled(RuntimeError):
@@ -35,6 +49,10 @@ class SessionConfig:
     allow_concession: bool = True
     allow_conviction: bool = False  # If True, agents can be convinced by opposing arguments
     require_moderator_approval: bool = True
+    # Stop debating (and rule immediately) when the remaining token budget
+    # drops below FORCE_VERDICT_RESERVE_TOKENS — guarantees a verdict lands
+    # before the hard budget kills the session.
+    force_verdict: bool = False
     verbose: bool = True
 
 
@@ -232,6 +250,10 @@ The debate ends when:
                 self.transcript.total_rounds = round_num
                 self._log(f"\n=== ROUND {round_num} ===\n")
 
+                if self._should_force_verdict():
+                    termination_reason = TerminationReason.FORCED_VERDICT
+                    break
+
                 # Prosecution argues
                 self._phase(f"round {round_num}: prosecution", self.prosecution)
                 prosecution_response = self._get_advocate_argument(
@@ -247,6 +269,10 @@ The debate ends when:
                     winner = "defense"
                     break
 
+                if self._should_force_verdict():
+                    termination_reason = TerminationReason.FORCED_VERDICT
+                    break
+
                 # Defense responds
                 self._phase(f"round {round_num}: defense", self.defense)
                 defense_response = self._get_advocate_argument(
@@ -260,6 +286,10 @@ The debate ends when:
                 if self.config.allow_concession and self._check_concession(defense_response):
                     termination_reason = TerminationReason.CONCESSION
                     winner = "prosecution"
+                    break
+
+                if self._should_force_verdict():
+                    termination_reason = TerminationReason.FORCED_VERDICT
                     break
 
                 # Moderator evaluates
@@ -562,13 +592,18 @@ IMPORTANT: Before making your final ruling, you SHOULD use web search to verify 
 Include [SEARCH: your query] to search for relevant laws, precedents, or legal analysis.
 Your ruling should be grounded in verified legal principles."""
 
+        forced_note = (
+            f"\n{FORCED_VERDICT_NOTE}\n"
+            if termination_reason == TerminationReason.FORCED_VERDICT
+            else ""
+        )
         instruction = f"""
 {context}
 
 The debate has concluded.
 Termination reason: {termination_reason.value}
 {winner_instruction}
-{search_reminder}
+{forced_note}{search_reminder}
 Please provide your final ruling and summary of the proceedings.
 """
         messages = history + [Message(role="user", content=instruction)]
@@ -605,10 +640,15 @@ Please provide your final ruling and summary of the proceedings.
             if can_search
             else ""
         )
+        forced_note = (
+            f" {FORCED_VERDICT_NOTE}"
+            if termination_reason == TerminationReason.FORCED_VERDICT
+            else ""
+        )
         instruction = f"""
 {context}
 
-The debate has concluded (reason: {termination_reason.value}). {winner_note}{search_note}
+The debate has concluded (reason: {termination_reason.value}). {winner_note}{forced_note}{search_note}
 When ready, submit your complete final ruling with the submit_verdict tool.
 """
         convo = history + [Message(role="user", content=instruction)]
@@ -732,6 +772,23 @@ Give your complete final ruling:
             raise SessionCancelled()
         if self.on_status:
             self.on_status(stage, agent)
+
+    def _should_force_verdict(self) -> bool:
+        """True when the remaining budget must be reserved for the ruling."""
+        if not self.config.force_verdict:
+            return False
+        meter = getattr(self.moderator, "meter", None)
+        if not meter or not getattr(meter, "hard_limit_tokens", None):
+            return False
+        tin, tout = meter.total_tokens()
+        remaining = meter.hard_limit_tokens - (tin + tout)
+        if remaining < FORCE_VERDICT_RESERVE_TOKENS:
+            self._log(
+                f"  [force verdict: {remaining:,} tokens left < "
+                f"{FORCE_VERDICT_RESERVE_TOKENS:,} reserve — cutting to the ruling]"
+            )
+            return True
+        return False
 
     def _check_concession(self, response: str) -> bool:
         """Check if the response contains a concession."""

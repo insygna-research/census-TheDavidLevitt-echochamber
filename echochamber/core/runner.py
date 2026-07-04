@@ -81,6 +81,9 @@ class DebateSpec:
     max_searches_per_turn: int = 2
     moderator_searches_per_turn: int = 5
     max_total_tokens: Optional[int] = None  # hard stop across all agents (None = unlimited)
+    # Cut to the final ruling when remaining budget drops below the reserve,
+    # so a verdict always lands before the hard budget stops the session.
+    force_verdict: bool = False
     # Per-response output cap. Reasoning models (Gemini 2.5, o-series) spend
     # "thinking" tokens from this budget, so 1-2k truncates visible output.
     max_response_tokens: int = 4096
@@ -344,6 +347,7 @@ def run_debate(
         max_rounds=spec.max_rounds,
         allow_concession=spec.allow_concession,
         allow_conviction=spec.allow_conviction,
+        force_verdict=spec.force_verdict,
         verbose=spec.verbose,
     )
 

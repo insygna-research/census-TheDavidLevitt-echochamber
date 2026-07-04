@@ -83,3 +83,48 @@ def test_on_status_reports_stage_and_agent():
         ("round 1: evaluation", "Moderator"),
         ("final ruling", "Moderator"),
     ]
+
+
+def test_force_verdict_cuts_to_ruling_before_budget_dies():
+    from echochamber.core.session import FORCED_VERDICT_NOTE
+
+    # 150 tokens/call against a 5,000 budget: after the opening, remaining
+    # (~4,850) is under the 10k reserve, so the debate cuts straight to the
+    # ruling instead of burning the budget on more rounds.
+    meter = UsageMeter(hard_limit_tokens=5_000)
+    mod_provider = FakeProvider(["opening", "FINAL VERDICT: DRAW because time ran out"])
+
+    def agent(name, role, responses):
+        return Agent(name=name, role=role, provider=FakeProvider(list(responses)), meter=meter)
+
+    session = CourtSession(
+        agent("Prosecution", Role.PROSECUTION, []),  # never called
+        agent("Defense", Role.DEFENSE, []),
+        Agent(name="Moderator", role=Role.MODERATOR, provider=mod_provider, meter=meter),
+        config=SessionConfig(verbose=False, max_rounds=3, force_verdict=True),
+    )
+    result = session.run("Topic", "Position")
+
+    assert result.termination_reason == TerminationReason.FORCED_VERDICT
+    assert result.winner == "draw"
+    # The ruling prompt carried the disregard-unanswered-arguments instruction
+    ruling_prompt = mod_provider.calls[-1]["messages"][-1].content
+    assert FORCED_VERDICT_NOTE in ruling_prompt
+
+
+def test_force_verdict_off_by_default():
+    meter = UsageMeter(hard_limit_tokens=5_000)
+
+    def agent(name, role, responses):
+        return Agent(name=name, role=role, provider=FakeProvider(list(responses)), meter=meter)
+
+    session = CourtSession(
+        agent("Prosecution", Role.PROSECUTION, ["arg"]),
+        agent("Defense", Role.DEFENSE, ["counter"]),
+        agent("Moderator", Role.MODERATOR, [
+            "opening", "CONTINUE: NO\nWINNER: DEFENSE\nREASONING: done", "ruling",
+        ]),
+        config=SessionConfig(verbose=False, max_rounds=1),
+    )
+    result = session.run("Topic", "Position")
+    assert result.termination_reason == TerminationReason.MODERATOR_DECISION

@@ -112,9 +112,16 @@ def _recs_markdown() -> str:
     return "\n".join(lines)
 
 
+_ESTIMATE_DISCLAIMER = (
+    "  \n_Disclaimer: this is a rough approximation; the actual footprint may "
+    "be higher. Setting a hard token budget is strongly recommended._"
+)
+
+
 def estimate_md(pros_provider, pros_model, def_provider, def_model,
-                mod_provider, mod_model, rounds, iterations) -> str:
-    """Live footprint estimate: tokens, dollars, wall-clock. Red above $1."""
+                mod_provider, mod_model, rounds, iterations,
+                token_budget=None) -> str:
+    """Live footprint estimate. Money is bold red; warns if budget < estimate."""
     try:
         models = [
             resolve_model(pros_provider, _text(pros_model) or None, "advocate"),
@@ -132,13 +139,27 @@ def estimate_md(pros_provider, pros_model, def_provider, def_model,
     if fp["cost_max"] == 0:
         cost_str = "free (local models)"
     else:
-        cost_str = f"${fp['cost_min']:.2f}–${fp['cost_max']:.2f}"
-    body = (f"~{fp['tokens']:,} tokens · {cost_str} · {time_str} "
-            f"({fp['calls']} model calls, {fp['iterations']} iteration(s))")
-    if fp["cost_max"] > 1.0:
-        return (f"**Estimated footprint:** 🔴 "
-                f"<span style='color:#f87171;font-weight:bold'>{body}</span>")
-    return f"**Estimated footprint:** 🟢 {body}"
+        cost_str = (
+            f"<span style='color:#f87171;font-weight:bold'>"
+            f"${fp['cost_min']:.2f}–${fp['cost_max']:.2f}</span>"
+        )
+    flag = "🔴" if fp["cost_max"] > 1.0 else "🟢"
+    lines = [
+        f"**Estimated footprint:** {flag} ~{fp['tokens']:,} tokens · {cost_str} · "
+        f"{time_str} ({fp['calls']} model calls, {fp['iterations']} iteration(s))"
+        + _ESTIMATE_DISCLAIMER
+    ]
+    try:
+        budget = int(token_budget) if token_budget else None
+    except (TypeError, ValueError):
+        budget = None
+    if budget and fp["tokens"] > budget:
+        lines.append(
+            "<span style='color:#f87171;font-weight:bold'>⚠️ Warning: estimated "
+            "token burn exceeds the hard limit; the verdict may not be rendered. "
+            "Raise the budget or enable force-verdict.</span>"
+        )
+    return "\n\n".join(lines)
 
 
 def _position_outcome(winner, position) -> str:
@@ -325,7 +346,8 @@ def run_debate_ui(topic, position, pros_provider, pros_model, pros_instr,
                   def_provider, def_model, def_instr,
                   mod_provider, mod_model, mod_instr,
                   case_folder, context_strategy,
-                  rounds, iterations, enable_search, token_budget, on_close):
+                  rounds, iterations, enable_search, token_budget,
+                  force_verdict, on_close):
     """Generator: streams (status, tokens, chat, verdict) updates while the debate runs."""
     chat: list[dict] = []
     iters = max(1, int(iterations or 1))
@@ -360,6 +382,7 @@ def run_debate_ui(topic, position, pros_provider, pros_model, pros_instr,
         max_rounds=int(rounds),
         enable_search=bool(enable_search),
         max_total_tokens=budget,
+        force_verdict=bool(force_verdict),
         verbose=False,
     )
 
@@ -552,15 +575,15 @@ def _debate_tab():
                     )
                 role_inputs[role] = (provider, model, instructions)
 
-            with gr.Accordion("🤖 APA model recommendations", open=False):
+            with gr.Accordion("🤖 AgentStable model recommendations", open=False):
                 gr.Markdown(_recs_markdown())
                 # Apply buttons set provider + model only (not instructions)
                 rec_outputs = [w for triple in role_inputs.values() for w in triple[:2]]
                 with gr.Row():
-                    gr.Button("Apply APA winners", size="sm").click(
+                    gr.Button("Apply #1 picks", size="sm").click(
                         lambda: _apply_recs(1), outputs=rec_outputs
                     )
-                    gr.Button("Apply APA fallbacks", size="sm").click(
+                    gr.Button("Apply #2 picks", size="sm").click(
                         lambda: _apply_recs(2), outputs=rec_outputs
                     )
 
@@ -573,21 +596,26 @@ def _debate_tab():
             enable_search = gr.Checkbox(label="Enable web search", value=False)
 
             estimate = gr.Markdown(estimate_md(
-                DEFAULT_PROVIDER, "", DEFAULT_PROVIDER, "", DEFAULT_PROVIDER, "", 2, 1,
+                DEFAULT_PROVIDER, "", DEFAULT_PROVIDER, "", DEFAULT_PROVIDER, "",
+                2, 1, 200_000,
             ))
-            estimate_inputs = [
-                role_inputs["prosecution"][0], role_inputs["prosecution"][1],
-                role_inputs["defense"][0], role_inputs["defense"][1],
-                role_inputs["moderator"][0], role_inputs["moderator"][1],
-                rounds, iterations,
-            ]
-            for component in estimate_inputs:
-                component.change(estimate_md, inputs=estimate_inputs, outputs=[estimate])
-
             token_budget = gr.Number(
                 label="Hard token budget (total across all agents and iterations)",
                 value=200_000, precision=0,
             )
+            force_verdict = gr.Checkbox(
+                label="Force a verdict before the budget runs out "
+                      "(reserves ~10,000 tokens for the ruling)",
+                value=True,
+            )
+            estimate_inputs = [
+                role_inputs["prosecution"][0], role_inputs["prosecution"][1],
+                role_inputs["defense"][0], role_inputs["defense"][1],
+                role_inputs["moderator"][0], role_inputs["moderator"][1],
+                rounds, iterations, token_budget,
+            ]
+            for component in estimate_inputs:
+                component.change(estimate_md, inputs=estimate_inputs, outputs=[estimate])
             on_close = gr.Radio(
                 ["Abort the debate", "Continue in background"],
                 value="Abort the debate",
@@ -610,7 +638,8 @@ def _debate_tab():
     inputs = [topic, position]
     for role in ("prosecution", "defense", "moderator"):
         inputs.extend(role_inputs[role])
-    inputs.extend([case_folder, context_strategy, rounds, iterations, enable_search, token_budget, on_close])
+    inputs.extend([case_folder, context_strategy, rounds, iterations,
+                   enable_search, token_budget, force_verdict, on_close])
 
     # The running-flag is toggled by dedicated js-only listeners so the main
     # event's input payload is never transformed client-side.

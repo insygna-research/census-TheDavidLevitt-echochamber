@@ -163,6 +163,11 @@ Examples:
         help="Hard token budget across all agents; the session halts gracefully when crossed (default: unlimited)",
     )
     parser.add_argument(
+        "--force-verdict",
+        action="store_true",
+        help="Cut to the final ruling when remaining budget drops below ~10k tokens, guaranteeing a verdict",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress verbose output during debate",
@@ -268,6 +273,7 @@ def main():
         max_searches_per_turn=args.max_searches_per_turn,
         moderator_searches_per_turn=args.moderator_searches_per_turn,
         max_total_tokens=args.max_total_tokens,
+        force_verdict=args.force_verdict,
         verbose=not args.quiet,
         transcript_dir=args.transcript_dir,
         save_transcript_json=args.save_transcript,
