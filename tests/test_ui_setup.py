@@ -65,3 +65,18 @@ def test_overview_reports_masked_status(env_file, monkeypatch):
 
 def test_key_test_requires_a_key(env_file):
     assert ui.test_provider_key("anthropic", "").startswith("❌")
+
+
+def test_run_debate_ui_tolerates_untouched_none_inputs():
+    """Gradio sends None for never-touched Textboxes; first yield must not crash."""
+    gen = ui.run_debate_ui(
+        "Topic", "Position",
+        "lmstudio", None, None,
+        "lmstudio", None, None,
+        "lmstudio", None, None,
+        None, None,  # case folder + context strategy untouched
+        1, False, None, None,
+    )
+    status, tokens, chat, verdict = next(gen)
+    assert "Starting debate" in status
+    gen.close()

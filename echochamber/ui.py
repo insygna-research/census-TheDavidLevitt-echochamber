@@ -129,7 +129,10 @@ def key_overview_md() -> str:
     for provider, env_key in PROVIDER_ENV_KEYS.items():
         lines.append(f"| {provider} | `{env_key}` | {_mask(os.environ.get(env_key, ''))} |")
     lines.append("| lmstudio | _(none needed)_ | local server on :1234 |")
-    lines.append(f"\nKeys are saved to `{ENV_FILE}` (owner-read-only) and loaded on launch.")
+    lines.append(
+        "\nKeys are saved to `.env` in the folder EchoChamber was launched from "
+        "(owner-read-only) and loaded on launch."
+    )
     return "\n".join(lines)
 
 
@@ -251,6 +254,11 @@ def inspect_evidence(path: str) -> str:
         return f"❌ Could not load `{path}`: {e}"
 
 
+def _text(value) -> str:
+    """Normalize an optional Textbox value — untouched fields arrive as None."""
+    return (value or "").strip()
+
+
 def run_debate_ui(topic, position, pros_provider, pros_model, pros_instr,
                   def_provider, def_model, def_instr,
                   mod_provider, mod_model, mod_instr,
@@ -276,16 +284,16 @@ def run_debate_ui(topic, position, pros_provider, pros_model, pros_instr,
         topic=topic,
         position=position,
         prosecution_provider=pros_provider,
-        prosecution_model=pros_model.strip() or None,
-        prosecution_instructions=pros_instr.strip(),
+        prosecution_model=_text(pros_model) or None,
+        prosecution_instructions=_text(pros_instr),
         defense_provider=def_provider,
-        defense_model=def_model.strip() or None,
-        defense_instructions=def_instr.strip(),
+        defense_model=_text(def_model) or None,
+        defense_instructions=_text(def_instr),
         moderator_provider=mod_provider,
-        moderator_model=mod_model.strip() or None,
-        moderator_instructions=mod_instr.strip(),
-        case_folder=case_folder.strip() or None,
-        context_strategy=context_strategy,
+        moderator_model=_text(mod_model) or None,
+        moderator_instructions=_text(mod_instr),
+        case_folder=_text(case_folder) or None,
+        context_strategy=context_strategy or "auto",
         max_rounds=int(rounds),
         enable_search=bool(enable_search),
         max_total_tokens=budget,
@@ -464,11 +472,13 @@ def _debate_tab():
         inputs.extend(role_inputs[role])
     inputs.extend([case_folder, context_strategy, rounds, enable_search, token_budget, on_close])
 
+    # The running-flag is toggled by dedicated js-only listeners so the main
+    # event's input payload is never transformed client-side.
+    run_btn.click(None, js="() => { window.__ec_running = true; }")
     run_event = run_btn.click(
         run_debate_ui,
         inputs=inputs,
         outputs=[status, tokens, chatbot, verdict],
-        js="(...args) => { window.__ec_running = true; return args; }",
     )
     run_event.then(None, js="() => { window.__ec_running = false; }")
     stop_btn.click(stop_debate, outputs=[status])
