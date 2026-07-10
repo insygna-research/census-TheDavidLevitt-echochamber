@@ -22,8 +22,10 @@ Set $ECHOCHAMBER_APA_DATA to an APA data directory (or merged export) to see
 live procurement recommendations instead of the bundled sample.
 """
 
+import json
 import os
 import queue
+import re
 import stat
 import threading
 from pathlib import Path
@@ -101,13 +103,86 @@ ENV_FILE = Path.cwd() / ".env"
 _active_stop: dict = {"event": None}
 _runs: list[dict] = []
 
-# Warn (native browser dialog) when leaving while a debate is running.
+# Warn (native browser dialog) when leaving while a debate is running, and
+# initialize the text-evidence entry editors (contenteditable blocks where
+# Enter starts a new entry — marked by a faint rule — and Shift+Enter
+# continues the current entry on a new line).
 _HEAD_JS = """
+<style>
+.ec-entry-host {
+  min-height: 7em; max-height: 20em; overflow-y: auto;
+  border: 1px solid rgba(128,128,128,.35); border-radius: 6px;
+  padding: 8px 10px; font-size: .9em; line-height: 1.45; outline: none;
+}
+.ec-entry-host:focus { border-color: rgba(99,102,241,.8); }
+.ec-entry { padding: 4px 0; min-height: 1.2em; }
+.ec-entry + .ec-entry { border-top: 1px solid rgba(128,128,128,.28); }
+.ec-entry-host:empty::before, .ec-entry:only-child:empty::before {
+  content: 'Type evidence… Enter = new entry, Shift+Enter = new line';
+  opacity: .45;
+}
+/* Mounted-but-invisible sync channel (visible=False would leave the DOM) */
+.ec-hidden-sync { position: absolute !important; left: -9999px !important;
+  height: 1px !important; width: 1px !important; overflow: hidden !important; }
+</style>
 <script>
 window.__ec_running = false;
 window.addEventListener('beforeunload', (e) => {
   if (window.__ec_running) { e.preventDefault(); e.returnValue = ''; }
 });
+
+function ecSync(host) {
+  const entries = Array.from(host.querySelectorAll(':scope > .ec-entry'))
+    .map((d) => d.innerText.replace(/\\u00a0/g, ' ').trim())
+    .filter((t) => t.length > 0);
+  const sync = document.querySelector('#' + host.dataset.sync + ' textarea');
+  if (!sync) return;
+  sync.value = JSON.stringify(entries);
+  sync.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+function ecNewEntry(host) {
+  const sel = window.getSelection();
+  let current = sel.anchorNode;
+  while (current && current.parentNode !== host) current = current.parentNode;
+  const entry = document.createElement('div');
+  entry.className = 'ec-entry';
+  entry.innerHTML = '<br>';
+  if (current && current.nextSibling) host.insertBefore(entry, current.nextSibling);
+  else host.appendChild(entry);
+  const range = document.createRange();
+  range.setStart(entry, 0);
+  range.collapse(true);
+  sel.removeAllRanges();
+  sel.addRange(range);
+}
+
+function ecInitEditors() {
+  document.querySelectorAll('.ec-entry-host').forEach((host) => {
+    if (host.dataset.ecInit) return;
+    host.dataset.ecInit = '1';
+    host.contentEditable = 'true';
+    if (!host.querySelector('.ec-entry')) {
+      host.innerHTML = '<div class="ec-entry"><br></div>';
+    }
+    host.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        ecNewEntry(host);
+        ecSync(host);
+      }
+      // Shift+Enter: default behavior — a new line inside the current entry
+    });
+    host.addEventListener('input', () => ecSync(host));
+  });
+}
+setInterval(ecInitEditors, 700);
+window.ecClearEditor = function (hostId) {
+  const host = document.getElementById(hostId);
+  if (!host) return;
+  host.innerHTML = '<div class="ec-entry"><br></div>';
+  ecSync(host);
+};
 </script>
 """
 
@@ -590,6 +665,58 @@ def run_debate_ui(topic, position, pros_provider, pros_model, pros_instr,
             _active_stop["event"] = None
 
 
+# -------------------------------------------------------- typed-in evidence
+
+def save_text_evidence(entries_json, case_folder, section):
+    """Persist typed entries as numbered evidence files in the case folder."""
+    try:
+        entries = [e for e in json.loads(entries_json or "[]") if e.strip()]
+    except json.JSONDecodeError:
+        entries = []
+    if not entries:
+        return "⚠️ Nothing to save — type at least one entry first."
+
+    folder = Path(_text(case_folder) or "cases/manual_case")
+    for sub in ("shared", "prosecution", "defense", "moderator"):
+        (folder / sub).mkdir(parents=True, exist_ok=True)
+    target = folder / section
+
+    existing = len(list(target.glob("entry-*.txt")))
+    saved = []
+    for offset, text in enumerate(entries, start=existing + 1):
+        slug = re.sub(r"[^a-z0-9]+", "-", text.lower()[:28]).strip("-") or "note"
+        name = f"entry-{offset:02d}-{slug}.txt"
+        (target / name).write_text(text + "\n")
+        saved.append(name)
+    return (f"✅ Saved {len(saved)} entr{'y' if len(saved) == 1 else 'ies'} to "
+            f"`{target}`: {', '.join(saved)} — reload evidence to pick them up.")
+
+
+def _text_evidence_panel(uid: str, case_folder):
+    """Shared 'type evidence' editor: Enter = new entry, Shift+Enter = new line."""
+    gr.Markdown(
+        "**✍️ Or type evidence directly** — press **Enter** to start a new "
+        "entry (separated by a faint line), **Shift+Enter** for a new line "
+        "within the entry (bulleted lists etc.). Nothing is processed until "
+        "you click Save."
+    )
+    gr.HTML(f"<div id='ec-editor-{uid}' class='ec-entry-host' "
+            f"data-sync='ec-sync-{uid}'></div>")
+    sync = gr.Textbox(elem_id=f"ec-sync-{uid}", elem_classes=["ec-hidden-sync"],
+                      container=False)
+    with gr.Row():
+        section = gr.Dropdown(
+            ["shared", "prosecution", "defense", "moderator"],
+            value="shared", label="Save into", scale=1,
+        )
+        save_btn = gr.Button("💾 Save entries as evidence", size="sm", scale=1)
+        clear_btn = gr.Button("🧹 Clear", size="sm", scale=0)
+    status = gr.Markdown("")
+    save_btn.click(save_text_evidence, inputs=[sync, case_folder, section],
+                   outputs=[status])
+    clear_btn.click(None, js=f"() => window.ecClearEditor('ec-editor-{uid}')")
+
+
 # ---------------------------------------------------------------- ablation
 
 _abl_stop = threading.Event()
@@ -703,7 +830,7 @@ def stop_ablation():
 def run_ablation_ui(case_folder, topic, position, provider, model,
                     judge_provider, judge_model, rounds, runs,
                     ablate_selection, protect_names, mode, grid,
-                    budget_per_debate, parallel, output_dir):
+                    budget_per_debate, campaign_budget, parallel, output_dir):
     """Generator: streams ablation progress into the tab."""
     if not _text(case_folder) or not _text(topic) or not _text(position):
         yield "### ⚠️ Case folder, topic, and position are required.", ""
@@ -729,6 +856,7 @@ def run_ablation_ui(case_folder, topic, position, provider, model,
         protect=protect,
         scenarios=scenarios,
         max_total_tokens_per_debate=int(budget_per_debate) if budget_per_debate else None,
+        max_campaign_tokens=int(campaign_budget) if campaign_budget else None,
         parallel=max(1, int(parallel or 1)),
         output_dir=_text(output_dir) or "./ablation/run",
     )
@@ -790,11 +918,13 @@ def _ablation_tab():
     )
     with gr.Row():
         with gr.Column(scale=1):
-            case_folder = gr.Textbox(label="Case folder", placeholder="cases/example_case")
-            load_btn = gr.Button("📂 Load evidence", size="sm")
+            case_folder = gr.Textbox(label="Case folder", placeholder="cases/example_case", elem_id="abl-case-folder")
+            load_btn = gr.Button("📂 Load evidence", size="sm", elem_id="abl-load")
             load_status = gr.Markdown("")
-            topic = gr.Textbox(label="Topic")
-            position = gr.Textbox(label="Prosecution position")
+            with gr.Accordion("✍️ Type evidence", open=False):
+                _text_evidence_panel("ablation", case_folder)
+            topic = gr.Textbox(label="Topic", elem_id="abl-topic")
+            position = gr.Textbox(label="Prosecution position", elem_id="abl-position")
             with gr.Row():
                 provider = gr.Dropdown(PROVIDERS, value=DEFAULT_PROVIDER,
                                        label="Advocates provider", scale=1)
@@ -806,14 +936,20 @@ def _ablation_tab():
             with gr.Row():
                 rounds = gr.Slider(1, 6, value=2, step=1, label="Rounds", scale=1)
                 runs = gr.Number(label="Runs per condition (auto mode)",
-                                 value=20, precision=0, minimum=1, scale=1)
+                                 value=20, precision=0, minimum=1, scale=1,
+                                 elem_id="abl-runs")
             with gr.Row():
                 budget = gr.Number(label="Token budget per debate",
                                    value=60_000, precision=0, scale=1)
+                campaign_budget = gr.Number(
+                    label="Campaign token budget (hard stop, all debates)",
+                    value=2_000_000, precision=0, scale=1, elem_id="abl-campaign",
+                )
                 parallel = gr.Number(label="Parallel debates",
-                                     value=4, precision=0, minimum=1, maximum=16, scale=1)
+                                     value=4, precision=0, minimum=1, maximum=16, scale=1,
+                                     elem_id="abl-parallel")
             output_dir = gr.Textbox(label="Output folder (checkpoint + report)",
-                                    value="./ablation/run")
+                                    value="./ablation/run", elem_id="abl-output")
 
         with gr.Column(scale=2):
             mode = gr.Radio(["Auto (leave-one-out)", "Manual grid"],
@@ -851,7 +987,8 @@ def _ablation_tab():
         run_ablation_ui,
         inputs=[case_folder, topic, position, provider, model,
                 judge_provider, judge_model, rounds, runs,
-                ablate, names_state, mode, grid, budget, parallel, output_dir],
+                ablate, names_state, mode, grid, budget, campaign_budget,
+                parallel, output_dir],
         outputs=[status, results],
     )
     stop_btn.click(stop_ablation, outputs=[status])
@@ -886,6 +1023,7 @@ def _debate_tab():
                     inspect_btn = gr.Button("🔍 Inspect evidence", size="sm", scale=1)
                 evidence_info = gr.Markdown("")
                 inspect_btn.click(inspect_evidence, inputs=[case_folder], outputs=[evidence_info])
+                _text_evidence_panel("debate", case_folder)
 
             role_inputs = {}
             for role in ("prosecution", "defense", "moderator"):

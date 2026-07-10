@@ -5,6 +5,9 @@
 ### 📹 Full debate, live
 https://github.com/user-attachments/assets/79130956-d2f3-47c2-b596-e12a99ce815d
 
+### 📹 Evidence ablation: type evidence, run an 80-debate salience campaign
+See [docs/demo-ablation.mp4](docs/demo-ablation.mp4) — or the walkthrough below.
+
 ### 📹 Setup & configuration walkthrough
 https://github.com/user-attachments/assets/dc0125e9-2728-4452-8c8e-f8a5f76daa0c
 
@@ -136,6 +139,18 @@ Auto mode gives every evidence file a leave-one-out scenario (`--protect`
 exempts files); a JSON grid (`--scenarios`) defines arbitrary conditions.
 The GUI's **Ablation tab** offers both: checkboxes for the auto evaluator and
 an editable grid — one column per scenario, mark the files to exclude.
+
+Evidence doesn't have to be files: the **type-evidence editor** (Debate and
+Ablation tabs) turns typed text into evidence — **Enter** starts a new entry
+(separated by a faint rule), **Shift+Enter** continues the entry on a new
+line for bulleted lists; nothing is written until you click Save, which
+persists each entry as a numbered file in the chosen case-folder section.
+
+Billing is guarded at two levels: every debate carries its own token budget
+(with force-verdict), and `--max-campaign-tokens` is a campaign-wide hard
+stop that halts scheduling once completed runs cross it — safe with
+concurrent debates (parallel dispatch runs in waves with the budget checked
+between waves, so overshoot is bounded by one wave of per-debate budgets).
 
 The primary outcome is the judge's signed verdict margin (−100…+100, from a
 `strength` field on the structured verdict), which detects far smaller

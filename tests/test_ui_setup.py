@@ -80,3 +80,29 @@ def test_run_debate_ui_tolerates_untouched_none_inputs():
     status, tokens, chat, verdict = next(gen)
     assert "Starting debate" in status
     gen.close()
+
+
+def test_save_text_evidence_writes_entry_files(tmp_path):
+    import json as _json
+
+    entries = _json.dumps([
+        "Witness saw the defendant at 9pm",
+        "Bank records:\n- transfer of $9,000\n- dated March 3",
+    ])
+    status = ui.save_text_evidence(entries, str(tmp_path / "case"), "prosecution")
+    assert "✅ Saved 2 entries" in status
+
+    files = sorted((tmp_path / "case" / "prosecution").glob("entry-*.txt"))
+    assert len(files) == 2
+    assert "Witness saw" in files[0].read_text()
+    assert "- transfer of $9,000" in files[1].read_text()  # multi-line preserved
+    # standard case-folder skeleton was created
+    assert (tmp_path / "case" / "shared").is_dir()
+
+    # appending later continues the numbering
+    status2 = ui.save_text_evidence(_json.dumps(["third"]), str(tmp_path / "case"), "prosecution")
+    assert "entry-03" in status2
+
+
+def test_save_text_evidence_empty_is_noop(tmp_path):
+    assert "Nothing to save" in ui.save_text_evidence("[]", str(tmp_path / "c"), "shared")

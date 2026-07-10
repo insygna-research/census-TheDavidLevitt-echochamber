@@ -147,3 +147,98 @@ def test_unknown_exclusion_is_rejected(tmp_path):
         raise AssertionError("expected ValueError for unknown evidence")
     except ValueError as e:
         assert "unknown evidence" in str(e)
+
+
+def test_campaign_token_budget_stops_scheduling(tmp_path):
+    case = make_case(tmp_path)
+
+    def factory(provider, model=None, **kw):
+        if provider == "judge":
+            return FakeProvider([
+                "opening",
+                tool_call_response("submit_evaluation", {
+                    "continue_debate": False, "winner": "defense", "reasoning": "d",
+                }),
+                tool_call_response("submit_verdict", {
+                    "winner": "defense", "strength": 50, "reasoning": "r",
+                }),
+            ], supports_tools=True)
+        return FakeProvider(["argument"])
+
+    # Each debate burns 5 calls x 150 tokens = 750; cap at 1,000 → the first
+    # completed debate crosses the threshold and the second is never dispatched.
+    config = AblationConfig(
+        case_folder=str(case), topic="T", position="P",
+        provider="adv", judge_provider="judge", rounds=1, runs=5,
+        protect=["alpha.txt", "beta.txt", "gamma.txt"],  # baseline only
+        max_campaign_tokens=1_000,
+        output_dir=str(tmp_path / "capped"),
+    )
+    report = run_ablation(config, provider_factory=factory, log=lambda s: None)
+    assert report["total_debates"] < 5  # scheduling stopped early
+    assert report["total_debates"] >= 1
+
+
+def test_campaign_budget_with_concurrent_debates(tmp_path):
+    """Parallel dispatch stops between waves; overshoot bounded by one wave."""
+    case = make_case(tmp_path)
+    calls = {"n": 0}
+    lock_free_counter = threading.Lock()
+    import threading as _t
+
+    def factory(provider, model=None, **kw):
+        with lock_free_counter:
+            calls["n"] += 1
+        if provider == "judge":
+            return FakeProvider([
+                "opening",
+                tool_call_response("submit_evaluation", {
+                    "continue_debate": False, "winner": "defense", "reasoning": "d",
+                }),
+                tool_call_response("submit_verdict", {
+                    "winner": "defense", "strength": 50, "reasoning": "r",
+                }),
+            ], supports_tools=True)
+        return FakeProvider(["argument"])
+
+    config = AblationConfig(
+        case_folder=str(case), topic="T", position="P",
+        provider="adv", judge_provider="judge", rounds=1, runs=10,
+        protect=["alpha.txt", "beta.txt", "gamma.txt"],  # baseline only, 10 runs
+        max_campaign_tokens=1_500,   # ~2 debates' worth
+        parallel=3,
+        output_dir=str(tmp_path / "capped-par"),
+    )
+    report = run_ablation(config, provider_factory=factory, log=lambda s: None)
+    # First wave of 3 runs completes (2,250 tokens > cap), second never starts
+    assert report["total_debates"] <= 3
+
+
+import threading
+
+
+def test_shared_meter_budget_is_concurrency_safe():
+    """Many threads recording into one hard-limited meter all stop."""
+    from echochamber.core.usage import TokenBudgetExceeded, UsageMeter
+
+    meter = UsageMeter(hard_limit_tokens=10_000)
+    tripped = []
+
+    def worker():
+        try:
+            for _ in range(100):
+                meter.record(module="m", provider="p", model="gpt-4o",
+                             usage={"input_tokens": 100, "output_tokens": 100})
+        except TokenBudgetExceeded:
+            tripped.append(True)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(tripped) == 8  # every concurrent agent hit the stop
+    tin, tout = meter.total_tokens()
+    # No runaway: the crossing call in each thread is recorded, nothing more
+    assert tin + tout <= 10_000 + 8 * 200

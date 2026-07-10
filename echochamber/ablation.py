@@ -74,6 +74,11 @@ class AblationConfig:
     protect: list = field(default_factory=list)   # never ablated (auto mode)
     scenarios: list = field(default_factory=list)  # manual grid; empty = auto
     max_total_tokens_per_debate: Optional[int] = 60_000
+    # Campaign-wide hard stop. The scheduler refuses to dispatch new debates
+    # once completed runs total this many tokens; with N concurrent debates
+    # the worst-case overshoot is N x max_total_tokens_per_debate (in-flight
+    # debates still finish under their own per-debate budgets).
+    max_campaign_tokens: Optional[int] = None
     max_response_tokens: int = 4096
     output_dir: str = "./ablation"
     parallel: int = 1
@@ -212,7 +217,19 @@ def run_ablation(
         f"({len(done)} already complete, {len(pending)} to go, parallel={config.parallel})")
 
     manifest_lock = threading.Lock()
-    progress = {"n": len(done)}
+    progress = {"n": len(done), "tokens": sum(r["tokens"] for r in records)}
+
+    def _campaign_budget_hit() -> bool:
+        if not config.max_campaign_tokens:
+            return False
+        with manifest_lock:
+            spent = progress["tokens"]
+        if spent >= config.max_campaign_tokens:
+            log(f"Campaign token budget reached ({spent:,} >= "
+                f"{config.max_campaign_tokens:,}) — no further debates dispatched. "
+                f"Raise --max-campaign-tokens and rerun to resume.")
+            return True
+        return False
 
     def _run_one(scenario: Scenario, run_idx: int) -> dict:
         spec = _spec_for(config, scenario)
@@ -252,6 +269,7 @@ def run_ablation(
                 f.write(json.dumps(record) + "\n")
             records.append(record)
             progress["n"] += 1
+            progress["tokens"] += record["tokens"]
             n = progress["n"]
         log(f"  [{n}/{total}] {scenario.name} run {run_idx}: "
             f"{record['winner'] or 'undecided'}"
@@ -262,18 +280,23 @@ def run_ablation(
         return record
 
     if config.parallel > 1:
+        # Dispatch in waves of `parallel` so the campaign budget check runs
+        # between waves — bounding overshoot to one wave of per-debate budgets.
         with ThreadPoolExecutor(max_workers=config.parallel) as pool:
-            futures = []
-            for scenario, i in pending:
-                if should_stop and should_stop():
+            queue = list(pending)
+            while queue:
+                if (should_stop and should_stop()) or _campaign_budget_hit():
                     break
-                futures.append(pool.submit(_run_one, scenario, i))
-            for future in as_completed(futures):
-                future.result()
+                wave, queue = queue[:config.parallel], queue[config.parallel:]
+                futures = [pool.submit(_run_one, s, i) for s, i in wave]
+                for future in as_completed(futures):
+                    future.result()
     else:
         for scenario, i in pending:
             if should_stop and should_stop():
                 log("Ablation stopped; rerun with the same --output to resume.")
+                break
+            if _campaign_budget_hit():
                 break
             _run_one(scenario, i)
 
@@ -401,6 +424,9 @@ def parse_args():
                         help="JSON file with a manual scenario grid")
     parser.add_argument("--max-total-tokens", type=int, default=60_000,
                         help="Budget per debate (default: 60000)")
+    parser.add_argument("--max-campaign-tokens", type=int, default=None,
+                        help="Hard stop for the whole campaign; scheduling halts "
+                             "once completed runs total this many tokens")
     parser.add_argument("--parallel", type=int, default=1)
     parser.add_argument("--output", type=str, default="./ablation/run",
                         help="Output dir: manifest, transcripts, report (resumable)")
@@ -423,6 +449,7 @@ def main():
         protect=args.protect,
         scenarios=load_scenarios_file(args.scenarios) if args.scenarios else [],
         max_total_tokens_per_debate=args.max_total_tokens,
+        max_campaign_tokens=args.max_campaign_tokens,
         output_dir=args.output,
         parallel=args.parallel,
         verbose=args.verbose,
