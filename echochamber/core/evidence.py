@@ -164,12 +164,18 @@ class EvidenceStore:
     introduced: list[Evidence] = field(default_factory=list)  # Previously private, now shared
 
     @classmethod
-    def load(cls, case_path: str | Path) -> "EvidenceStore":
+    def load(
+        cls,
+        case_path: str | Path,
+        exclude: Optional[list] = None,
+    ) -> "EvidenceStore":
         """
         Load evidence from a case folder.
 
         Args:
             case_path: Path to the case folder
+            exclude: Evidence file names to drop after loading (used by
+                ablation studies to run "the same case minus this document")
 
         Returns:
             Populated EvidenceStore
@@ -186,7 +192,24 @@ class EvidenceStore:
         store.defense = store._load_folder(case_path / "defense", owner="defense")
         store.moderator = store._load_folder(case_path / "moderator", owner="moderator")
 
+        if exclude:
+            dropped = set(exclude)
+            store.shared = [e for e in store.shared if e.name not in dropped]
+            store.prosecution = [e for e in store.prosecution if e.name not in dropped]
+            store.defense = [e for e in store.defense if e.name not in dropped]
+            store.moderator = [e for e in store.moderator if e.name not in dropped]
+
         return store
+
+    def list_names(self) -> list[tuple[str, str]]:
+        """All evidence as (file_name, section) pairs, section order preserved."""
+        out = []
+        for section, items in (
+            ("shared", self.shared), ("prosecution", self.prosecution),
+            ("defense", self.defense), ("moderator", self.moderator),
+        ):
+            out.extend((e.name, section) for e in items)
+        return out
 
     def _load_folder(self, folder: Path, owner: Optional[str]) -> list[Evidence]:
         """Load all supported files from a folder."""

@@ -73,6 +73,8 @@ class DebateSpec:
     defense_instructions: str = ""
     moderator_instructions: str = ""
     case_folder: Optional[str] = None
+    # Evidence file names to drop from the case (ablation studies)
+    exclude_evidence: list = field(default_factory=list)
     context_strategy: str = "auto"  # auto | full | summarize | rag
     max_context_tokens: int = 100_000
     rag_chunks: int = 10
@@ -109,7 +111,9 @@ def _load_evidence(spec: DebateSpec, log: Callable[[str], None]):
     Returns:
         (evidence_for_session, raw_evidence, strategy_str)
     """
-    raw_evidence = EvidenceStore.load(spec.case_folder)
+    raw_evidence = EvidenceStore.load(spec.case_folder, exclude=spec.exclude_evidence)
+    if spec.exclude_evidence:
+        log(f"\nAblated evidence (excluded): {', '.join(spec.exclude_evidence)}")
     log(f"\n{raw_evidence.summary()}")
 
     if spec.context_strategy == "auto":

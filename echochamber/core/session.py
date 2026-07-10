@@ -63,6 +63,10 @@ class SessionResult:
     termination_reason: TerminationReason
     winner: Optional[str] = None
     rounds_completed: int = 0
+    # Judge-reported margin of victory (0-100) from the structured verdict;
+    # None on the text protocol. Gives ablation/eval studies a continuous
+    # outcome with far more statistical power than win/loss alone.
+    verdict_strength: Optional[int] = None
 
 
 # Structured decision tools for the moderator. Providers without tool
@@ -106,12 +110,20 @@ VERDICT_TOOL = ToolDef(
                 "enum": ["prosecution", "defense", "draw"],
                 "description": "The side that made the stronger case, or draw.",
             },
+            "strength": {
+                "type": "integer",
+                "description": (
+                    "Margin of victory, 0-100: 0 = coin flip / draw, "
+                    "100 = complete rout. Judge the gap between the cases, "
+                    "not your confidence in the topic itself."
+                ),
+            },
             "reasoning": {
                 "type": "string",
                 "description": "Your complete final ruling and summary of the proceedings.",
             },
         },
-        "required": ["winner", "reasoning"],
+        "required": ["winner", "strength", "reasoning"],
     },
 )
 
@@ -324,6 +336,7 @@ The debate ends when:
 
         # Get final ruling (may update winner if not already set). Skipped for
         # budget/cancel stops — the whole point is to stop spending tokens.
+        verdict_strength = None
         if termination_reason in (TerminationReason.TOKEN_BUDGET, TerminationReason.CANCELLED):
             final_ruling = (
                 f"Session halted ({termination_reason.value}) before a final ruling could be made."
@@ -332,7 +345,7 @@ The debate ends when:
         else:
             self._phase("final ruling", self.moderator)
             try:
-                final_ruling, final_winner = self._get_final_ruling(
+                final_ruling, final_winner, verdict_strength = self._get_final_ruling(
                     case_context, termination_reason, winner
                 )
             except TokenBudgetExceeded as e:
@@ -359,6 +372,7 @@ The debate ends when:
             termination_reason=termination_reason,
             winner=winner,
             rounds_completed=round_num,
+            verdict_strength=verdict_strength,
         )
 
     def _get_evidence_context_for_role(
@@ -553,14 +567,15 @@ End the debate (continue_debate = false) only if:
         case_context: str,
         termination_reason: TerminationReason,
         winner: Optional[str],
-    ) -> tuple[str, Optional[str]]:
+    ) -> tuple[str, Optional[str], Optional[int]]:
         """
         Get the moderator's final ruling.
 
         If search is enabled, allows the moderator to perform searches before ruling.
 
         Returns:
-            (ruling_text, winner) - winner may be updated from the ruling
+            (ruling_text, winner, strength) — winner may be updated from the
+            ruling; strength is the judge's 0-100 margin (None on text protocol)
         """
         context = self._get_evidence_context_for_role(Role.MODERATOR, case_context)
         history = self.transcript.get_conversation_history()
@@ -613,7 +628,7 @@ Please provide your final ruling and summary of the proceedings.
         if self.search_tool and self.max_moderator_searches > 0:
             ruling = self._process_ruling_searches(ruling, messages)
 
-        return ruling, self._extract_winner_from_ruling(ruling, winner)
+        return ruling, self._extract_winner_from_ruling(ruling, winner), None
 
     def _structured_ruling(
         self,
@@ -621,8 +636,8 @@ Please provide your final ruling and summary of the proceedings.
         history: list[Message],
         termination_reason: TerminationReason,
         winner: Optional[str],
-    ) -> Optional[tuple[str, Optional[str]]]:
-        """Final ruling via native tools. None on failure.
+    ) -> Optional[tuple[str, Optional[str], Optional[int]]]:
+        """Final ruling via native tools as (ruling, winner, strength). None on failure.
 
         The moderator may search the web (within budget) and must close with
         the submit_verdict tool.
@@ -674,13 +689,18 @@ When ready, submit your complete final ruling with the submit_verdict tool.
                         v if v in ("prosecution", "defense", "draw") else None
                     )
                     ruling = str(verdict_call.arguments.get("reasoning", "")) or response.content
-                    return ruling, final_winner
+                    try:
+                        strength = int(verdict_call.arguments.get("strength"))
+                        strength = max(0, min(100, strength))
+                    except (TypeError, ValueError):
+                        strength = None
+                    return ruling, final_winner, strength
 
                 if not response.tool_calls:
                     # Plain text ruling despite the tool being offered
                     return response.content, self._extract_winner_from_ruling(
                         response.content, winner
-                    )
+                    ), None
 
                 convo.append(Message(
                     role="assistant",

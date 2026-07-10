@@ -46,7 +46,15 @@ except ImportError:
 
 from collections import Counter
 
+from .ablation import (
+    AblationConfig,
+    Scenario,
+    auto_scenarios,
+    format_report,
+    run_ablation,
+)
 from .core.costs import estimate_debate_footprint, estimate_run_cost
+from .core.evidence import EvidenceStore
 from .core.runner import DebateSpec, resolve_model, run_debate
 from .core.session import TerminationReason
 from .core.usage import UsageMeter
@@ -582,6 +590,273 @@ def run_debate_ui(topic, position, pros_provider, pros_model, pros_instr,
             _active_stop["event"] = None
 
 
+# ---------------------------------------------------------------- ablation
+
+_abl_stop = threading.Event()
+
+_GRID_TRUTHY = {"x", "✓", "true", "1", "yes"}
+
+
+def _grid_default(evidence_names: list) -> list:
+    """Fresh manual-grid rows: 2 header rows + one row per evidence file."""
+    n_cols = 3
+    rows = [
+        ["Scenario name", "baseline", "", ""][: n_cols + 1],
+        ["# runs", "10", "", ""][: n_cols + 1],
+    ]
+    for name in evidence_names:
+        rows.append([name] + [""] * n_cols)
+    return rows
+
+
+def parse_grid(rows: list) -> list:
+    """Manual grid → scenarios. Row 0 = names, row 1 = # runs, then one row
+    per evidence file; a truthy cell means that file is EXCLUDED there."""
+    if not rows or len(rows) < 2:
+        return []
+    scenarios = []
+    n_cols = len(rows[0])
+    for col in range(1, n_cols):
+        name = str(rows[0][col] or "").strip()
+        if not name:
+            continue
+        try:
+            runs = int(float(rows[1][col]))
+        except (TypeError, ValueError):
+            continue
+        if runs <= 0:
+            continue
+        exclude = [
+            str(row[0]).strip()
+            for row in rows[2:]
+            if str(row[col] if col < len(row) else "").strip().lower() in _GRID_TRUTHY
+        ]
+        scenarios.append(Scenario(name=name, runs=runs, exclude=exclude))
+    return scenarios
+
+
+def load_case_evidence(case_folder):
+    """Populate the ablation controls from a case folder."""
+    try:
+        store = EvidenceStore.load(_text(case_folder))
+        names = [n for n, _ in store.list_names()]
+        sections = {n: s for n, s in store.list_names()}
+        labels = [f"{n}  ({sections[n]})" for n in names]
+        return (
+            gr.CheckboxGroup(choices=names, value=names),
+            gr.Dataframe(value=_grid_default(names)),
+            names,
+            f"✅ {len(names)} evidence files loaded: "
+            + ", ".join(labels),
+        )
+    except Exception as e:
+        return gr.skip(), gr.skip(), [], f"❌ {e}"
+
+
+def ablation_estimate_md(provider, model, judge_provider, judge_model,
+                         rounds, runs, ablate_selection, mode, grid, names):
+    """Footprint for the whole campaign, funding-colored."""
+    try:
+        if mode == "Manual grid":
+            scenarios = parse_grid(grid)
+            total_runs = sum(s.runs for s in scenarios)
+            n_scen = len(scenarios)
+        else:
+            n_scen = len(ablate_selection or []) + 1  # + baseline
+            total_runs = int(runs or 0) * n_scen
+        if total_runs <= 0:
+            return "_No runs configured yet._"
+
+        adv = resolve_model(provider, _text(model) or None, "advocate")
+        judge = resolve_model(
+            _text(judge_provider) or provider,
+            _text(judge_model) or (_text(model) or None), "moderator",
+        )
+        fp = estimate_debate_footprint(adv, adv, judge, max_rounds=int(rounds or 1),
+                                       iterations=total_runs)
+        _, _, breakdown = estimate_run_cost(adv, adv, judge, max_rounds=int(rounds or 1))
+        adv_cls = _fund_class(provider)
+        judge_cls = _fund_class(_text(judge_provider) or provider)
+        per_class: dict = {}
+        for role_key, data in breakdown.items():
+            cls = judge_cls if role_key == "moderator" else adv_cls
+            per_class[cls] = per_class.get(cls, 0.0) + data["cost"] * total_runs
+        parts = [
+            _fund_span(cls, f"${per_class[cls] * 0.5:.2f}–${per_class[cls] * 1.5:.2f}")
+            for cls in ("real", "credit", "included") if per_class.get(cls)
+        ]
+        cost_str = " · ".join(parts) if parts else "free (local models)"
+        hours = fp["seconds"] / 3600
+        time_str = f"~{hours:.1f} h" if hours >= 1 else f"~{fp['seconds'] / 60:.0f} min"
+        return (f"**Campaign estimate:** {n_scen} scenarios · {total_runs} debates · "
+                f"~{fp['tokens']:,} tokens · {cost_str} · {time_str} sequential "
+                f"(divide by parallelism)" + _ESTIMATE_DISCLAIMER)
+    except Exception as e:
+        return f"_Estimate unavailable: {e}_"
+
+
+def stop_ablation():
+    _abl_stop.set()
+    return "### ⏹️ Stopping after in-flight debates finish… (rerun to resume)"
+
+
+def run_ablation_ui(case_folder, topic, position, provider, model,
+                    judge_provider, judge_model, rounds, runs,
+                    ablate_selection, protect_names, mode, grid,
+                    budget_per_debate, parallel, output_dir):
+    """Generator: streams ablation progress into the tab."""
+    if not _text(case_folder) or not _text(topic) or not _text(position):
+        yield "### ⚠️ Case folder, topic, and position are required.", ""
+        return
+
+    _abl_stop.clear()
+    scenarios = parse_grid(grid) if mode == "Manual grid" else []
+    if mode == "Manual grid" and not scenarios:
+        yield "### ⚠️ The grid has no runnable scenarios (need a name and # runs > 0).", ""
+        return
+
+    protect = [n for n in (protect_names or []) if n not in (ablate_selection or [])]
+    config = AblationConfig(
+        case_folder=_text(case_folder),
+        topic=_text(topic),
+        position=_text(position),
+        provider=provider,
+        model=_text(model) or None,
+        judge_provider=_text(judge_provider) or None,
+        judge_model=_text(judge_model) or None,
+        rounds=int(rounds or 2),
+        runs=int(runs or 10),
+        protect=protect,
+        scenarios=scenarios,
+        max_total_tokens_per_debate=int(budget_per_debate) if budget_per_debate else None,
+        parallel=max(1, int(parallel or 1)),
+        output_dir=_text(output_dir) or "./ablation/run",
+    )
+
+    events: queue.Queue = queue.Queue()
+    done_box: dict = {}
+
+    def worker():
+        try:
+            report = run_ablation(
+                config,
+                log=lambda s: None,
+                on_progress=lambda n, total, rec: events.put(("run", (n, total, rec))),
+                should_stop=_abl_stop.is_set,
+            )
+            done_box["report"] = report
+            events.put(("done", report))
+        except Exception as e:
+            events.put(("error", str(e)))
+
+    threading.Thread(target=worker, daemon=True).start()
+    status = "### 🧪 Ablation running…"
+    cost = 0.0
+    yield status, ""
+
+    while True:
+        try:
+            kind, payload = events.get(timeout=1.0)
+        except queue.Empty:
+            yield gr.skip(), gr.skip()
+            continue
+        if kind == "run":
+            n, total, rec = payload
+            cost += rec["cost_usd"]
+            margin = f" ({rec['margin']:+.0f})" if rec.get("margin") is not None else ""
+            status = (f"### 🧪 Ablation: **{n}/{total}** debates — last: "
+                      f"*{rec['scenario']}* → {rec['winner'] or 'undecided'}{margin} · "
+                      f"spent {_fund_span(_fund_class(provider), f'${cost:.2f}')}")
+            yield status, gr.skip()
+        elif kind == "error":
+            yield f"### ❌ Ablation error: {payload}", gr.skip()
+            return
+        elif kind == "done":
+            report = payload
+            yield ("### ✅ Ablation complete — "
+                   f"{report['total_debates']} debates, ${report['total_cost_usd']}"),\
+                  format_report(report)
+            return
+
+
+def _ablation_tab():
+    gr.Markdown(
+        "### 🧪 Evidence-salience ablation\n"
+        "Run the case many times, then again with individual evidence removed, "
+        "and measure how the verdict moves. **Auto** ablates every file "
+        "(uncheck a file to protect it from ablation); **Manual grid** gives "
+        "full control: one column per scenario, mark the files to *exclude*. "
+        "Campaigns checkpoint to the output folder and resume if interrupted."
+    )
+    with gr.Row():
+        with gr.Column(scale=1):
+            case_folder = gr.Textbox(label="Case folder", placeholder="cases/example_case")
+            load_btn = gr.Button("📂 Load evidence", size="sm")
+            load_status = gr.Markdown("")
+            topic = gr.Textbox(label="Topic")
+            position = gr.Textbox(label="Prosecution position")
+            with gr.Row():
+                provider = gr.Dropdown(PROVIDERS, value=DEFAULT_PROVIDER,
+                                       label="Advocates provider", scale=1)
+                model = gr.Textbox(label="Model (blank = default)", scale=1)
+            with gr.Row():
+                judge_provider = gr.Dropdown([""] + PROVIDERS, value="",
+                                             label="Judge provider (blank = same)", scale=1)
+                judge_model = gr.Textbox(label="Judge model", scale=1)
+            with gr.Row():
+                rounds = gr.Slider(1, 6, value=2, step=1, label="Rounds", scale=1)
+                runs = gr.Number(label="Runs per condition (auto mode)",
+                                 value=20, precision=0, minimum=1, scale=1)
+            with gr.Row():
+                budget = gr.Number(label="Token budget per debate",
+                                   value=60_000, precision=0, scale=1)
+                parallel = gr.Number(label="Parallel debates",
+                                     value=4, precision=0, minimum=1, maximum=16, scale=1)
+            output_dir = gr.Textbox(label="Output folder (checkpoint + report)",
+                                    value="./ablation/run")
+
+        with gr.Column(scale=2):
+            mode = gr.Radio(["Auto (leave-one-out)", "Manual grid"],
+                            value="Auto (leave-one-out)", label="Mode")
+            ablate = gr.CheckboxGroup(
+                [], label="Evidence to ablate (unchecked files are never removed)",
+            )
+            grid = gr.Dataframe(
+                value=_grid_default([]),
+                label="Manual grid — row 1: scenario name · row 2: # runs · "
+                      "mark 'x' where a file is EXCLUDED",
+                interactive=True,
+                type="array",
+            )
+            estimate = gr.Markdown("_Load a case to see the campaign estimate._")
+            with gr.Row():
+                run_btn = gr.Button("🧪 Run ablation", variant="primary")
+                stop_btn = gr.Button("⏹️ Stop")
+            status = gr.Markdown("### 💤 Idle")
+            results = gr.Markdown("")
+
+    names_state = gr.State([])
+    load_btn.click(
+        load_case_evidence, inputs=[case_folder],
+        outputs=[ablate, grid, names_state, load_status],
+    )
+
+    est_inputs = [provider, model, judge_provider, judge_model,
+                  rounds, runs, ablate, mode, grid, names_state]
+    for component in (provider, model, judge_provider, judge_model,
+                      rounds, runs, ablate, mode):
+        component.change(ablation_estimate_md, inputs=est_inputs, outputs=[estimate])
+
+    run_btn.click(
+        run_ablation_ui,
+        inputs=[case_folder, topic, position, provider, model,
+                judge_provider, judge_model, rounds, runs,
+                ablate, names_state, mode, grid, budget, parallel, output_dir],
+        outputs=[status, results],
+    )
+    stop_btn.click(stop_ablation, outputs=[status])
+
+
 # ------------------------------------------------------------------- layout
 
 def _debate_tab():
@@ -754,6 +1029,8 @@ def build_app() -> "gr.Blocks":
         gr.Markdown("# ⚖️ EchoChamber — Multi-LLM Courtroom Debate")
         with gr.Tab("Debate"):
             _debate_tab()
+        with gr.Tab("Ablation"):
+            _ablation_tab()
         with gr.Tab("Setup"):
             _setup_tab()
     return app

@@ -116,6 +116,36 @@ export ECHOCHAMBER_AGENTSTABLE_DATA=~/path/to/data   # dir with apa-roles.json +
 
 The GUI (and `echochamber.recommendations`) then surfaces the top-2 models per debate role — judge maps to AgentStable's "reasoning" role, advocates to "daily" — each with justification, current price, and the benchmark bar it cleared. Without AgentStable data, a bundled sample keeps the feature demonstrable.
 
+### Evidence ablation — which document decides the case?
+
+Run the case many times with all evidence, then again with one document
+removed at a time, and measure how the verdict moves. Built for large
+campaigns: parallel execution, per-debate budgets with force-verdict, and a
+checkpoint manifest so interrupted campaigns resume where they stopped.
+
+```bash
+uv run python -m echochamber.ablation \
+  --case-folder cases/example_case \
+  --topic "Python vs Rust for High-Performance Data Processing" \
+  --position "Rust should be chosen for the new system" \
+  --provider gemini --runs 20 --rounds 2 --parallel 4 \
+  --output ./ablation/rust_case
+```
+
+Auto mode gives every evidence file a leave-one-out scenario (`--protect`
+exempts files); a JSON grid (`--scenarios`) defines arbitrary conditions.
+The GUI's **Ablation tab** offers both: checkboxes for the auto evaluator and
+an editable grid — one column per scenario, mark the files to exclude.
+
+The primary outcome is the judge's signed verdict margin (−100…+100, from a
+`strength` field on the structured verdict), which detects far smaller
+effects per run than win/loss counting. Methodology guards are baked in: web
+search is disabled (an advocate could re-import removed evidence) and context
+strategy is pinned to `full` (auto-RAG would retrieve differently per
+condition). Verdicts are noisy — treat `--runs 20` as the floor for real
+conclusions, and remember models may know public facts from pretraining;
+ablation is sharpest on private or synthetic case facts.
+
 ### Batch runs
 
 ```bash

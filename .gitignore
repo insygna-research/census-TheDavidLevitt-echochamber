@@ -51,3 +51,6 @@ ENV/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Private local spec notes
+spec/LESSONS-local.md
