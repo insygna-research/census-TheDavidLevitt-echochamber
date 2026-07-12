@@ -1,0 +1,14 @@
+.git
+.venv
+.pytest_cache
+__pycache__
+*.pyc
+.env
+transcripts/
+ablation/
+docs/
+examples/
+tests/
+spec/
+echochamber.egg-info/
+uv.lock

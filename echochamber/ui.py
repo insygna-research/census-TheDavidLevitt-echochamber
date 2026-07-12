@@ -1175,7 +1175,20 @@ def build_app() -> "gr.Blocks":
 
 
 def main():
-    build_app().launch(theme=gr.themes.Soft())
+    # Container/proxy friendly: honor $PORT (Cloud Run), bind address, and a
+    # root path for serving behind a reverse-proxy prefix like /echochamber.
+    port = int(os.environ.get("PORT", "7860"))
+    host = os.environ.get(
+        "ECHOCHAMBER_HOST",
+        "0.0.0.0" if "PORT" in os.environ else "127.0.0.1",
+    )
+    root_path = os.environ.get("ECHOCHAMBER_ROOT_PATH", "") or None
+    build_app().launch(
+        theme=gr.themes.Soft(),
+        server_name=host,
+        server_port=port,
+        root_path=root_path,
+    )
 
 
 if __name__ == "__main__":
